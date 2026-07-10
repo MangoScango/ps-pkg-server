@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Runtime data
+cache/
+data/
+
+# Local PKG test fixtures (real packages, not for distribution)
+test-pkg/
+
+# Local scratch scripts (single leading underscore only; never dunder files)
+_[!_]*.py
+
+# Local config
+.env

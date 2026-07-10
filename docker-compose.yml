@@ -1,0 +1,22 @@
+services:
+  pkg-server:
+    image: ghcr.io/mangoscango/ps-pkg-server:latest
+    container_name: pkg-server
+    ports:
+    - "6767:8000"
+    environment:
+      # Colon-separated directories to scan (inside the container).
+      PKG_DIRS: "/ps4:/ps5"
+      ICON_DIR: "/data/icons"
+      SCAN_WORKERS: 8
+      # host:port the console downloads from. REQUIRED with bridge networking
+      # (below) since the app cannot auto-detect the reachable address.
+      PUBLIC_HOST: 192.168.1.10:6767
+
+    volumes:
+      - "/mnt/user/games/ps4:/ps4:ro"
+      - "/mnt/user/games/ps5:/ps5:ro"
+      # Persistent icon cache.
+      - "/mnt/user/appdata/ps-pkg-server:/data"
+
+    restart: unless-stopped
