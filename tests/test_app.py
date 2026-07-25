@@ -61,7 +61,7 @@ def test_app_endpoints():
             r = client.get("/")
             assert r.status_code == 200
             assert "Alpha" in r.text
-            assert "title(s)" in r.text
+            assert "PS PKG Server" in r.text
 
             # Grouped API
             groups = client.get("/api/groups").json()

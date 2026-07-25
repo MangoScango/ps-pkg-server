@@ -190,13 +190,17 @@ def _render_index(result: Optional[ScanResult]) -> str:
   header {{ display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px; padding: 12px 16px; border-bottom: 1px solid #2a2e35; position: sticky; top: 0; background: #14161a; z-index: 5; }}
   .hleft {{ display: flex; align-items: baseline; gap: 10px; min-width: 0; }}
   .hleft h1 {{ font-size: 18px; margin: 0; white-space: nowrap; }}
-  .count {{ color: #9aa0a6; font-size: 13px; white-space: nowrap; }}
   .hright {{ display: flex; align-items: center; gap: 8px; margin-left: auto; }}
   button {{ background: #3b82f6; color: white; border: 0; padding: 9px 16px; border-radius: 6px; cursor: pointer; font-size: 14px; }}
   button:hover {{ background: #2563eb; }}
   button.rescan {{ margin: 0; flex: 0 0 auto; white-space: nowrap; }}
-  .groups {{ display: flex; flex-direction: column; gap: 10px; padding: 16px 24px 24px; max-width: 900px; }}
-  .group {{ background: #1c1f26; border: 1px solid #2a2e35; border-radius: 10px; overflow: hidden; }}
+  /* Base = single column stack (also the no-JS fallback). JS turns this into a
+     row of independent column stacks (.cols + .gcol) so expanding one card only
+     grows its own column instead of leaving gaps across a shared grid row. */
+  .groups {{ display: flex; flex-direction: column; gap: 10px; padding: 16px 24px 24px; max-width: 900px; margin: 0 auto; }}
+  .groups.cols {{ flex-direction: row; align-items: flex-start; }}
+  .gcol {{ display: flex; flex-direction: column; gap: 10px; flex: 1 1 0; min-width: 0; }}
+  .group {{ background: #1c1f26; border: 1px solid #2a2e35; border-radius: 10px; overflow: hidden; min-width: 0; }}
   .group summary {{ display: flex; align-items: center; gap: 14px; padding: 12px 14px; cursor: pointer; list-style: none; }}
   .group summary::-webkit-details-marker {{ display: none; }}
   .group summary:hover {{ background: #21252d; }}
@@ -235,7 +239,7 @@ def _render_index(result: Optional[ScanResult]) -> str:
   .console {{ display: flex; align-items: center; gap: 6px; }}
   /* 16px font keeps iOS from zooming when focusing an input. */
   .console input, .console select {{ background: #1c1f26; border: 1px solid #2a2e35; color: #e8eaed; border-radius: 6px; padding: 8px 10px; font-size: 16px; min-width: 0; }}
-  .console select {{ cursor: pointer; }}
+  .console select {{ cursor: pointer; max-width: 100%; }}
   .console #cip {{ width: 130px; }}
   .console #cport {{ width: 72px; }}
   .badge {{ font-size: 10px; font-weight: 600; padding: 2px 7px; border-radius: 10px; white-space: nowrap; text-transform: uppercase; letter-spacing: .03em; background: #374151; color: #d1d5db; }}
@@ -260,8 +264,12 @@ def _render_index(result: Optional[ScanResult]) -> str:
      the IP field grows to fill, and the group padding tightens. */
   @media (max-width: 600px) {{
     .hright {{ width: 100%; margin-left: 0; flex-wrap: wrap; }}
-    .console {{ flex: 1 1 auto; }}
-    .console #cip {{ flex: 1; width: auto; }}
+    /* Stack the console: protocol on its own row, IP + port share the next.
+       Keeps the wide protocol <select> from forcing horizontal scroll. */
+    .console {{ flex: 1 1 100%; flex-wrap: wrap; }}
+    .console select {{ flex: 1 1 100%; }}
+    .console #cip {{ flex: 1 1 120px; width: auto; }}
+    .console #cport {{ flex: 0 0 80px; width: auto; }}
     .groups {{ padding: 12px 12px 24px; }}
     .group summary {{ gap: 10px; padding: 10px; }}
     .icon img, .icon .noicon {{ width: 56px; height: 56px; }}
@@ -285,13 +293,20 @@ def _render_index(result: Optional[ScanResult]) -> str:
     .path {{ display: none; }}
     .mstatus {{ font-size: 10px; }}
   }}
+
+  /* Wider viewports get more room; the JS picks 2 then 3 columns to match. */
+  @media (min-width: 900px) {{
+    .groups {{ max-width: 1280px; }}
+  }}
+  @media (min-width: 1320px) {{
+    .groups {{ max-width: 1860px; }}
+  }}
 </style>
 </head>
 <body>
 <header>
   <div class="hleft">
     <h1>PS PKG Server</h1>
-    <span class="count">{count} title(s)</span>
   </div>
   <div class="hright">
     <div class="console">
@@ -418,6 +433,36 @@ async function sendAll(ev, btn) {{
   }}
   btn.textContent = old; btn.disabled = false;
 }}
+
+// Masonry-ish columns: distribute the group cards round-robin into independent
+// column stacks so expanding one card only grows its own column. Cards keep
+// left-to-right reading order across the top. Column count tracks the same
+// breakpoints as the CSS max-width (1 / 2 / 3). Cards are moved (not recreated),
+// so open state and push status are preserved across re-layouts.
+let _groupCards = null;
+function layoutGroups() {{
+  const c = document.querySelector('.groups');
+  if (!c) return;
+  if (!_groupCards) _groupCards = Array.from(c.querySelectorAll('.group'));
+  const w = c.clientWidth || window.innerWidth;
+  const n = w >= 1320 ? 3 : (w >= 900 ? 2 : 1);
+  if (c.dataset.cols === String(n)) return;  // same column count -> leave as is
+  c.dataset.cols = String(n);
+  c.classList.add('cols');
+  c.innerHTML = '';
+  const cols = [];
+  for (let i = 0; i < n; i++) {{
+    const d = document.createElement('div');
+    d.className = 'gcol';
+    c.appendChild(d);
+    cols.push(d);
+  }}
+  _groupCards.forEach((card, i) => cols[i % n].appendChild(card));
+}}
+// Cheap on every event: it early-returns unless the column count actually
+// changed, so the layout snaps at breakpoints during a live drag.
+window.addEventListener('resize', layoutGroups);
+layoutGroups();
 </script>
 </body>
 </html>"""
