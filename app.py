@@ -13,10 +13,14 @@ Run:
 from __future__ import annotations
 
 import html
+import json
 import os
+import re
 import socket
+import urllib.error
+import urllib.request
 from contextlib import asynccontextmanager
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlencode
 
 from fastapi import FastAPI, Request
@@ -230,7 +234,8 @@ def _render_index(result: Optional[ScanResult]) -> str:
   .btn.sendall:disabled {{ background: #374151; color: #9aa0a6; cursor: default; }}
   .console {{ display: flex; align-items: center; gap: 6px; }}
   /* 16px font keeps iOS from zooming when focusing an input. */
-  .console input {{ background: #1c1f26; border: 1px solid #2a2e35; color: #e8eaed; border-radius: 6px; padding: 8px 10px; font-size: 16px; min-width: 0; }}
+  .console input, .console select {{ background: #1c1f26; border: 1px solid #2a2e35; color: #e8eaed; border-radius: 6px; padding: 8px 10px; font-size: 16px; min-width: 0; }}
+  .console select {{ cursor: pointer; }}
   .console #cip {{ width: 130px; }}
   .console #cport {{ width: 72px; }}
   .badge {{ font-size: 10px; font-weight: 600; padding: 2px 7px; border-radius: 10px; white-space: nowrap; text-transform: uppercase; letter-spacing: .03em; background: #374151; color: #d1d5db; }}
@@ -290,6 +295,13 @@ def _render_index(result: Optional[ScanResult]) -> str:
   </div>
   <div class="hright">
     <div class="console">
+      <select id="cproto" title="Console install protocol">
+        <option value="ezremote">ezremote-dpi</option>
+        <option value="etahen_v1">etaHEN DPI v1</option>
+        <option value="etahen_v2">etaHEN DPI v2</option>
+        <option value="remote_pkg">PS4 Remote PKG Installer</option>
+        <option value="goldhen">PS4 GoldHEN</option>
+      </select>
       <input id="cip" placeholder="Console IP" autocomplete="off" inputmode="decimal">
       <input id="cport" placeholder="Port" value="9040" autocomplete="off" inputmode="numeric">
     </div>
@@ -303,8 +315,8 @@ async function rescan(btn) {{
   try {{ await fetch('/api/rescan', {{ method: 'POST' }}); location.reload(); }}
   finally {{ btn.disabled = false; btn.textContent = 'Rescan'; }}
 }}
-// Persist console IP/port across reloads.
-['cip', 'cport'].forEach(id => {{
+// Persist console protocol/IP/port across reloads.
+['cproto', 'cip', 'cport'].forEach(id => {{
   const el = document.getElementById(id);
   const key = 'pkgserver_' + id;
   const saved = localStorage.getItem(key);
@@ -312,22 +324,39 @@ async function rescan(btn) {{
   el.addEventListener('change', () => localStorage.setItem(key, el.value));
 }});
 
+// Default listen ports per protocol. Switching protocol updates the port only
+// when the user hasn't set a custom one (empty or still a known default).
+const PROTO_PORTS = {{ ezremote: 9040, etahen_v1: 9090, etahen_v2: 12800, remote_pkg: 12800, goldhen: 9090 }};
+(() => {{
+  const proto = document.getElementById('cproto');
+  const port = document.getElementById('cport');
+  proto.addEventListener('change', () => {{
+    const defaults = Object.values(PROTO_PORTS).map(String);
+    const cur = port.value.trim();
+    if (!cur || defaults.includes(cur)) {{
+      port.value = PROTO_PORTS[proto.value] || cur;
+      localStorage.setItem('pkgserver_cport', port.value);
+    }}
+  }});
+}})();
+
 const PUSH_DELAY_MS = 1000;  // gap AFTER the console responds, before the next push
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 function getConsole() {{
   const ip = document.getElementById('cip').value.trim();
   const port = parseInt(document.getElementById('cport').value, 10);
+  const proto = document.getElementById('cproto').value;
   if (!ip || !port) {{ alert('Enter the console IP and port first.'); return null; }}
-  return {{ ip, port }};
+  return {{ ip, port, proto }};
 }}
 
-async function doPush(id, ip, port) {{
+async function doPush(id, ip, port, proto) {{
   try {{
     const r = await fetch('/api/push', {{
       method: 'POST',
       headers: {{ 'Content-Type': 'application/json' }},
-      body: JSON.stringify({{ console_ip: ip, console_port: port, pkg_id: id }})
+      body: JSON.stringify({{ console_ip: ip, console_port: port, pkg_id: id, protocol: proto }})
     }});
     return await r.json();
   }} catch (e) {{
@@ -364,7 +393,7 @@ async function push(id, btn) {{
   const member = btn.closest('.member');
   const old = btn.innerHTML; btn.disabled = true; btn.innerHTML = '&hellip;';
   setStatus(member, 'pushing', 'Sending\u2026');
-  const j = await doPush(id, c.ip, c.port);
+  const j = await doPush(id, c.ip, c.port, c.proto);
   const r = resultLabel(j);
   setStatus(member, r.state, r.text, r.title);
   btn.innerHTML = old; btn.disabled = false;
@@ -382,7 +411,7 @@ async function sendAll(ev, btn) {{
     const m = members[i];
     btn.textContent = 'Sending ' + (i + 1) + '/' + members.length;
     setStatus(m, 'pushing', 'Sending\u2026');
-    const j = await doPush(m.dataset.id, c.ip, c.port);
+    const j = await doPush(m.dataset.id, c.ip, c.port, c.proto);
     const r = resultLabel(j);
     setStatus(m, r.state, r.text, r.title);
     if (i < members.length - 1) await sleep(PUSH_DELAY_MS);
@@ -506,58 +535,230 @@ def _serve_split(parts, filename: str, request: Request):
     )
 
 
+# Supported console push protocols. "ezremote" is the original MangoScango/
+# ps5-ezremote-dpi dialect (raw TCP, plain URL line, bare-integer reply).
+# "etahen"/"etahen_v1" and "etahen_v2" target etaHEN's DirectPKGInstaller:
+#   v1  raw TCP :9090, JSON payload, {"res":"N"} reply
+#   v2  HTTP    :12800, POST /upload form fields, "SUCCESS:"/"FAILED:" text reply
+# "remote_pkg" is flatz's ps4_remote_pkg_installer (and the OOP fork):
+#   HTTP :12800, POST /api/install {"type":"direct","packages":[url]}, JSON reply.
+#   PS4-only: it fetches param.sfo/icon0 by range and rejects PS5 param.json.
+# "goldhen" is GoldHEN's embedded installer:
+#   raw TCP :9090, JSON {"id","contentUrl","contentName","iconPath"} (BGFT field
+#   names -- not the etaHEN shape), JSON reply.
+# All of them drive the console's own HTTP downloader against /download/{id}.
+PUSH_PROTOCOLS = (
+    "ezremote",
+    "etahen",
+    "etahen_v1",
+    "etahen_v2",
+    "remote_pkg",
+    "goldhen",
+)
+
+
 class PushRequest(BaseModel):
     console_ip: str
     console_port: int
     pkg_id: str
+    protocol: str = "ezremote"
 
 
 @app.post("/api/push")
 def api_push(req: PushRequest, request: Request) -> JSONResponse:
-    """Send a package's download URL to a console over a raw TCP connection.
+    """Tell a console to download and install a package over HTTP.
 
-    This behaves like echoing the URL to the console's listening port with
-    netcat. The URL carries the content id, name, and relative icon url as
-    query parameters.
+    Every supported protocol hands the console a ``/download/{id}`` URL that it
+    fetches itself (with range support, so installs resume). They differ only in
+    how the request is framed and how the reply is read -- see PUSH_PROTOCOLS.
     """
     record = state.index.get(req.pkg_id)
     if record is None:
         return JSONResponse({"ok": False, "error": "unknown package"}, status_code=404)
 
+    protocol = (req.protocol or "ezremote").lower()
+    if protocol not in PUSH_PROTOCOLS:
+        return JSONResponse(
+            {"ok": False, "error": f"unknown protocol {protocol!r}"}, status_code=400
+        )
+    if protocol == "remote_pkg" and record.platform == "PS5":
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": "the PS4 remote pkg installer does not support PS5 packages",
+            },
+            status_code=400,
+        )
+
     # Port the HTTP server is reachable on (as seen by this request).
     http_port = request.url.port or (443 if request.url.scheme == "https" else 80)
+    authority, server_ip = _server_authority(req.console_ip, req.console_port, http_port)
     icon_rel = f"/icons/{record.icon}" if record.icon else ""
+    icon_abs = f"http://{authority}{icon_rel}" if icon_rel else ""
+    name = record.title or record.filename
 
     try:
-        with socket.create_connection((req.console_ip, req.console_port), timeout=5) as sock:
-            # The local address used to reach the console is the server address
-            # the console can reach us on. PUBLIC_HOST overrides this when needed.
-            server_ip = sock.getsockname()[0]
-            authority = PUBLIC_HOST or f"{server_ip}:{http_port}"
+        if protocol == "ezremote":
+            # Metadata rides in the URL query string; icon stays relative.
             params = urlencode(
-                {
-                    "content_id": record.content_id or "",
-                    "name": record.title or record.filename,
-                    "icon": icon_rel,
-                }
+                {"content_id": record.content_id or "", "name": name, "icon": icon_rel}
             )
             url = f"http://{authority}/download/{req.pkg_id}?{params}"
-            sock.sendall((url + "\n").encode("utf-8"))
-            response = _read_console_response(sock)
+            result = _push_ezremote(req.console_ip, req.console_port, url)
+        elif protocol == "remote_pkg":
+            # flatz installer takes an array of piece URLs; our /download/{id}
+            # already serves a (possibly split) package as one contiguous,
+            # range-capable stream, so a single-element array is enough.
+            url = f"http://{authority}/download/{req.pkg_id}"
+            result = _push_remote_pkg(req.console_ip, req.console_port, url)
+        elif protocol == "goldhen":
+            # GoldHEN uses BGFT-style field names (id/contentUrl/contentName/
+            # iconPath), distinct from the etaHEN payload shape.
+            url = f"http://{authority}/download/{req.pkg_id}"
+            payload = {
+                "id": record.content_id or "",
+                "contentUrl": url,
+                "contentName": name,
+                "iconPath": icon_abs,
+            }
+            result = _push_goldhen(req.console_ip, req.console_port, payload)
+        else:
+            # etaHEN carries metadata in dedicated fields, so the URL stays clean
+            # and the icon must be absolute for the console to fetch it.
+            url = f"http://{authority}/download/{req.pkg_id}"
+            fields = {
+                "url": url,
+                "content_id": record.content_id or "",
+                "content_name": name,
+                "icon_url": icon_abs,
+            }
+            if protocol == "etahen_v2":
+                result = _push_etahen_v2(req.console_ip, req.console_port, fields)
+            else:  # etahen / etahen_v1
+                result = _push_etahen_v1(req.console_ip, req.console_port, fields)
     except OSError as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=502)
+    except urllib.error.URLError as e:
+        return JSONResponse({"ok": False, "error": str(e.reason)}, status_code=502)
 
-    code, code_hex = _parse_console_code(response)
     return JSONResponse(
         {
             "ok": True,
+            "protocol": protocol,
             "url": url,
             "server_ip": server_ip,
-            "response": response,
-            "code": code,
-            "code_hex": code_hex,
+            **result,
         }
     )
+
+
+def _server_authority(
+    console_ip: str, console_port: int, http_port: int
+) -> Tuple[str, str]:
+    """Return (authority, server_ip): the ``host:port`` the console should
+    download from, and the bare server IP.
+
+    PUBLIC_HOST wins when set. Otherwise we discover the local address that
+    routes toward the console using a connected UDP socket (no packets are
+    actually sent), which is the address the console can reach us on.
+    """
+    if PUBLIC_HOST:
+        return PUBLIC_HOST, PUBLIC_HOST.split(":", 1)[0]
+    server_ip = "127.0.0.1"
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect((console_ip, console_port))
+            server_ip = s.getsockname()[0]
+    except OSError:
+        pass
+    return f"{server_ip}:{http_port}", server_ip
+
+
+def _push_ezremote(console_ip: str, console_port: int, url: str) -> dict:
+    """ps5-ezremote-dpi: send the URL line over raw TCP, read a bare int code."""
+    with socket.create_connection((console_ip, console_port), timeout=5) as sock:
+        sock.sendall((url + "\n").encode("utf-8"))
+        response = _read_console_response(sock)
+    code, code_hex = _parse_console_code(response)
+    return {"response": response, "code": code, "code_hex": code_hex}
+
+
+def _push_etahen_v1(console_ip: str, console_port: int, fields: dict) -> dict:
+    """etaHEN DPI v1: send a JSON object over raw TCP (:9090), read {"res":"N"}.
+
+    The console's reader takes a single <=1024-byte read, so the payload is sent
+    in one write and stays compact.
+    """
+    payload = json.dumps(fields, separators=(",", ":"))
+    with socket.create_connection((console_ip, console_port), timeout=5) as sock:
+        sock.sendall(payload.encode("utf-8"))
+        response = _read_console_response(sock)
+    code, code_hex = _parse_etahen_v1_response(response)
+    return {"response": response, "code": code, "code_hex": code_hex}
+
+
+def _push_etahen_v2(console_ip: str, console_port: int, fields: dict) -> dict:
+    """etaHEN DPI v2: POST the fields to ``/upload`` (:12800), read status text.
+
+    The console's libmicrohttpd post processor accepts application/x-www-form-
+    urlencoded for the non-file fields, so no multipart framing is needed.
+    """
+    endpoint = f"http://{console_ip}:{console_port}/upload"
+    data = urlencode(fields).encode("utf-8")
+    http_req = urllib.request.Request(
+        endpoint,
+        data=data,
+        method="POST",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    with urllib.request.urlopen(http_req, timeout=PUSH_RESPONSE_TIMEOUT) as resp:
+        response = resp.read().decode("utf-8", "replace").strip()
+    code, code_hex = _parse_etahen_v2_response(response)
+    return {"response": response, "code": code, "code_hex": code_hex}
+
+
+def _push_remote_pkg(console_ip: str, console_port: int, download_url: str) -> dict:
+    """flatz ps4_remote_pkg_installer: POST /api/install with a direct package.
+
+    The installer reads the pkg header/param.sfo/icon0 from the URL by range
+    request, then registers a background download. A register failure returns
+    HTTP 200 with a hex ``error_code``; bad params/prerequisites return HTTP 500
+    with a JSON ``error`` string -- both are read and normalized here.
+    """
+    endpoint = f"http://{console_ip}:{console_port}/api/install"
+    payload = json.dumps({"type": "direct", "packages": [download_url]})
+    http_req = urllib.request.Request(
+        endpoint,
+        data=payload.encode("utf-8"),
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(http_req, timeout=PUSH_RESPONSE_TIMEOUT) as resp:
+            response = resp.read().decode("utf-8", "replace").strip()
+    except urllib.error.HTTPError as e:
+        # 500 carries a JSON error body we still want to surface, not a transport
+        # failure. (A real connection failure is a plain URLError -> handled by
+        # the caller as 502.)
+        response = e.read().decode("utf-8", "replace").strip()
+    code, code_hex = _parse_remote_pkg_response(response)
+    return {"response": response, "code": code, "code_hex": code_hex}
+
+
+def _push_goldhen(console_ip: str, console_port: int, payload: dict) -> dict:
+    """GoldHEN embedded installer: send a JSON object over raw TCP, read a JSON
+    reply.
+
+    The payload uses SceBgftDownloadParam field names (id/contentUrl/contentName/
+    iconPath). It's sent in a single write and the reply is read until the peer
+    closes (or the timeout elapses).
+    """
+    body = json.dumps(payload, separators=(",", ":"))
+    with socket.create_connection((console_ip, console_port), timeout=5) as sock:
+        sock.sendall(body.encode("utf-8"))
+        response = _read_console_response(sock)
+    code, code_hex = _parse_goldhen_response(response)
+    return {"response": response, "code": code, "code_hex": code_hex}
 
 
 def _read_console_response(sock: socket.socket) -> str:
@@ -594,3 +795,104 @@ def _parse_console_code(response: str):
     except ValueError:
         return None, None
     return code, f"0x{code & 0xFFFFFFFF:08X}"
+
+
+def _parse_etahen_v1_response(response: str):
+    """Parse etaHEN v1's ``{"res":"N"}`` reply into (int_code, hex_string).
+
+    Falls back to a bare-integer parse if the reply isn't the expected JSON.
+    """
+    if not response:
+        return None, None
+    try:
+        res = json.loads(response).get("res")
+    except (ValueError, AttributeError):
+        return _parse_console_code(response)
+    if res is None:
+        return None, None
+    try:
+        code = int(res)
+    except (ValueError, TypeError):
+        return None, None
+    return code, f"0x{code & 0xFFFFFFFF:08X}"
+
+
+def _parse_etahen_v2_response(response: str):
+    """Map etaHEN v2's status text to (int_code, hex_string).
+
+    A "SUCCESS" reply is normalized to code 0. A "FAILED" reply embeds the
+    numeric install error ("... code -2135813882 (0x80B22416) ..."), which we
+    extract so the UI can show it like the other protocols.
+    """
+    if not response:
+        return None, None
+    if response.startswith("SUCCESS"):
+        return 0, "0x00000000"
+    m = re.search(r"code (-?\d+)", response)
+    if m:
+        code = int(m.group(1))
+        return code, f"0x{code & 0xFFFFFFFF:08X}"
+    return None, None
+
+
+def _parse_remote_pkg_response(response: str):
+    """Map a ps4_remote_pkg_installer reply to (int_code, hex_string).
+
+    Three shapes are possible:
+      - success: ``{"status":"success","task_id":N,...}`` (valid JSON) -> 0
+      - register fail: ``{ "status": "fail", "error_code": 0x80B21106 }`` -- note
+        the hex literal makes this *invalid* JSON, so the code is pulled out with
+        a regex and normalized to a signed 32-bit int.
+      - param/prereq fail: ``{"status":"fail","error":"..."}`` (valid JSON) -> no
+        numeric code, the message travels in ``response``.
+    """
+    if not response:
+        return None, None
+    m = re.search(r'"error_code"\s*:\s*(0x[0-9A-Fa-f]+|-?\d+)', response)
+    if m:
+        raw = m.group(1)
+        code = int(raw, 16) if raw.lower().startswith("0x") else int(raw)
+        if code >= 0x80000000:  # unsigned 32-bit -> signed, matches other codes
+            code -= 0x100000000
+        return code, f"0x{code & 0xFFFFFFFF:08X}"
+    try:
+        obj = json.loads(response)
+    except ValueError:
+        return None, None
+    if isinstance(obj, dict) and obj.get("status") == "success":
+        return 0, "0x00000000"
+    return None, None
+
+
+def _parse_goldhen_response(response: str):
+    """Best-effort (int_code, hex_string) from a GoldHEN reply.
+
+    GoldHEN's exact reply schema isn't firmly documented (the reference sender
+    just logs it), so we accept the common shapes: a numeric ``res``/``error``/
+    ``error_code``/``code`` field, a ``status: success``, or a bare integer.
+    Anything else yields (None, None) and the UI reports "sent" without a code.
+    """
+    if not response:
+        return None, None
+    try:
+        obj = json.loads(response)
+    except ValueError:
+        return _parse_console_code(response)  # maybe a bare integer
+    if isinstance(obj, int):  # a bare JSON integer result code
+        code = obj - 0x100000000 if obj >= 0x80000000 else obj
+        return code, f"0x{code & 0xFFFFFFFF:08X}"
+    if isinstance(obj, dict):
+        for key in ("res", "error_code", "error", "code"):
+            value = obj.get(key)
+            if value is None:
+                continue
+            try:
+                code = int(value)
+            except (ValueError, TypeError):
+                continue
+            if code >= 0x80000000:  # unsigned 32-bit -> signed
+                code -= 0x100000000
+            return code, f"0x{code & 0xFFFFFFFF:08X}"
+        if obj.get("status") in ("success", "ok", 0, "0"):
+            return 0, "0x00000000"
+    return None, None

@@ -232,6 +232,7 @@ def build_ps5_pkg(param_obj, icon0=b"", content_id="UP4433-PPSA19639_00-CPREVIEW
     fih = bytearray(b"\x00" * cnt_base)
     fih[0:4] = b"\x7fFIH"
     fih[0x05] = signed
+    struct.pack_into("<H", fih, 0x06, 3)  # FIH format version (LE); mount requires 3
     struct.pack_into("<Q", fih, 0x58, cnt_base)  # embedded CNT offset
     return bytes(fih) + cnt
 
@@ -389,6 +390,46 @@ def test_ps5_full_app_with_patch_flags_is_base():
     with Pkg.from_source(BytesSource(img)) as pkg:
         assert pkg.kind == "Base Game"
         assert pkg.version == "01.905.000"
+
+
+def test_ps5_kind_flag_classification():
+    from pkgtool.pkg import classify_kind_ps5
+
+    # GD_AC (0x02000000) without GD_BASE -> DLC (best-effort add-on detection).
+    assert classify_kind_ps5(0x02000000, 0x20) == "DLC"
+    # GD_AC alongside GD_BASE (0x00020000) is a base/homebrew image, not DLC --
+    # this is the real LibProsperoPkg homebrew sample (flags 0x02020000).
+    assert classify_kind_ps5(0x02020000, 0x20) == "Base Game"
+    # NON_GAME (0x04000000) -> App.
+    assert classify_kind_ps5(0x04000000, 0x20) == "App"
+    # DELTA still wins over everything.
+    assert classify_kind_ps5(0x41000000, 0x23) == "Update"
+    # Plain full app.
+    assert classify_kind_ps5(0x00000000, 0x20) == "Base Game"
+
+
+def test_ps5_dlc_pkg_kind():
+    param = {
+        "titleId": "PPSA19639",
+        "localizedParameters": {"defaultLanguage": "en-US", "en-US": {"titleName": "Add-on"}},
+    }
+    img = build_ps5_pkg(param, content_flags=0x02000000)
+    with Pkg.from_source(BytesSource(img)) as pkg:
+        assert pkg.kind == "DLC"
+
+
+def test_fih_bad_version_rejected():
+    # A FIH image whose format version is not 3 must be rejected.
+    param = {"titleId": "PPSA00001",
+             "localizedParameters": {"defaultLanguage": "en", "en": {"titleName": "X"}}}
+    img = bytearray(build_ps5_pkg(param))
+    struct.pack_into("<H", img, 0x06, 2)  # downgrade the FIH version
+    try:
+        Pkg.from_source(BytesSource(bytes(img)))
+    except PkgError:
+        pass
+    else:
+        raise AssertionError("expected PkgError for unsupported FIH version")
 
 
 def test_ps5_title_fallback_any_language():

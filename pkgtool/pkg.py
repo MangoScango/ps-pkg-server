@@ -51,8 +51,19 @@ _OFF_PACKAGE_SIZE = 0x430  # declared total package size (u64 BE)
 
 # FIH header field offsets (little-endian). See LibProsperoPkg ProsperoPkgLayout.
 _FIH_SIGNED_BYTE = 0x05
+_FIH_FORMAT_VERSION = 0x06   # u16 LE; console mount path requires 3 for FIH
 _FIH_EMBEDDED_CNT_OFFSET = 0x58
 _LIH_EMBEDDED_CNT_OFFSET = 0x30
+
+# Finalized/intermediate image format versions (LibProsperoPkg ProsperoPkgLayout
+# FihRequiredFormatVersion / ProsperoNpDrmContentInfo.ResolveContainerOffset).
+# The version u16 sits at offset 0x06 and is read in the byte order of the header
+# carrying it: little-endian for the LE FIH/LIH images (a v3 image stores the
+# bytes 03 00), big-endian for the BE \x7FCNT container. Confirmed against a real
+# debug image (bytes 03 00 -> 3); the reference now reads FIH/LIH LE and CNT BE
+# (ProsperoNpDrmContentInfo.ResolveContainerOffset), matching this parser.
+_FIH_REQUIRED_VERSION = 3
+_LIH_REQUIRED_VERSION = 1
 
 _CONTENT_ID_SIZE = 0x30
 _ENTRY_SIZE = 0x20
@@ -65,11 +76,17 @@ ENTRY_IMAGE_KEY = 0x00000020
 ENTRY_GENERAL_DIGESTS = 0x00000080
 ENTRY_METAS = 0x00000100
 ENTRY_ENTRY_NAMES = 0x00000200
+ENTRY_IMAGEDIGS = 0x0000040A    # imagedigs.dat (present in every finalized PS5 image)
 ENTRY_PARAM_SFO = 0x00001000    # PS4 param.sfo
 ENTRY_PIC1_PNG = 0x00001006
 ENTRY_ICON0_PNG = 0x00001200    # PS4 and PS5
 ENTRY_PIC0_PNG = 0x00001220
-ENTRY_PARAM_JSON = 0x00002000   # PS5 param.json
+ENTRY_PARAM_JSON = 0x00002000   # PS5 param.json. Confirmed on a real PS5 image and
+                                # agreed by ps5-pkg-format.md and (as of the 7/13
+                                # update) LibProsperoPkg's ProsperoEntryId enum, which
+                                # was corrected to ParamJson=0x2000 / ParamSfo=0x1000.
+ENTRY_PLAYGO_HASH_TABLE_DAT = 0x00002010  # PS5 playgo-hash-table.dat (always present)
+ENTRY_PLAYGO_FICM_DAT = 0x00002011        # PS5 playgo-ficm.dat (always present)
 ENTRY_PLAYGO_CHUNK_DAT = 0x00001001       # base game playgo-chunk.dat
 ENTRY_APP_PLAYGO_CHUNK_DAT = 0x00001008   # update/patch app playgo-chunk.dat
 
@@ -96,12 +113,21 @@ CONTENT_TYPES_PS5 = {
     0x23: "DP",  # delta patch
 }
 
-# Content-flag patch bits (header 0x78). Shared by PS4 and PS5
-# (LibProsperoPkg ProsperoNpDrmContentInfo / PS4PKG.bt).
+# Content-flag bits (header 0x78). Shared by PS4 and PS5
+# (LibProsperoPkg ProsperoCntContentFlags / ProsperoNpDrmContentInfo / PS4PKG.bt).
+# Patch bits (note DELTA/CUMULATIVE share the SUBSEQUENT bit, so ordering matters
+# when classifying -- test the more specific masks first):
 _FLAG_FIRST_PATCH = 0x00100000
 _FLAG_SUBSEQUENT_PATCH = 0x40000000
 _FLAG_DELTA_PATCH = 0x41000000
 _FLAG_CUMULATIVE_PATCH = 0x60000000
+# PS5 content-classification bits (LibProsperoPkg ProsperoCntContentFlags):
+_FLAG_GD_BASE = 0x00020000   # base application content
+_FLAG_PATCHGO = 0x00200000
+_FLAG_REMASTER = 0x00400000
+_FLAG_PS_CLOUD = 0x00800000
+_FLAG_GD_AC = 0x02000000     # additional content (DLC)
+_FLAG_NON_GAME = 0x04000000  # non-game application
 
 # Header flags field (offset 0x04). Bit 31 = FINALIZED: set on retail (and PS5
 # debug) packages that went through Sony finalization; fake/homebrew fpkgs are
@@ -477,10 +503,23 @@ def _locate_cnt(source: ByteSource):
     head = source.read(0, 0x60)
     magic = head[0:4]
     if magic == PKG_MAGIC:
+        # Bare \x7FCNT: PS4 package or a bare PS5 CNT. The 0x06 field is part of
+        # the big-endian header flags here (not a FIH format version), so we do
+        # not version-check it -- the CNT magic path is shared by PS4 and PS5.
         return 0, None
     if magic == FIH_MAGIC:
+        version = struct.unpack_from("<H", head, _FIH_FORMAT_VERSION)[0]
+        if version != _FIH_REQUIRED_VERSION:
+            raise PkgError(
+                f"unsupported FIH format version {version} (expected {_FIH_REQUIRED_VERSION})"
+            )
         return _u64le(head, _FIH_EMBEDDED_CNT_OFFSET), head[_FIH_SIGNED_BYTE]
     if magic == LIH_MAGIC:
+        version = struct.unpack_from("<H", head, _FIH_FORMAT_VERSION)[0]
+        if version != _LIH_REQUIRED_VERSION:
+            raise PkgError(
+                f"unsupported LIH format version {version} (expected {_LIH_REQUIRED_VERSION})"
+            )
         return _u64le(head, _LIH_EMBEDDED_CNT_OFFSET), None
     raise PkgError("not a PS4/PS5 PKG (bad magic)")
 
@@ -688,23 +727,32 @@ def classify_kind(category: Optional[str], content_type: int) -> str:
 
 
 def classify_kind_ps5(content_flags: int, content_type: int) -> str:
-    """Classify a PS5 package as Update / Base Game.
+    """Classify a PS5 package as Update / DLC / App / Base Game.
 
-    Uses the content-flag patch bits (LibProsperoPkg ProsperoCntContentFlags /
+    Uses the content-flag bits (LibProsperoPkg ProsperoCntContentFlags /
     ProsperoNpDrmContentInfo), which is the reference/console signal -- not
     content_type, which the reference does not interpret.
 
-    Only a DELTA patch (0x41000000) is an incremental update that needs a base.
-    PS5 app images are cumulative, so a "subsequent" or "cumulative" full image
-    (e.g. Astro's Playroom shipped at 01.905.000) is a complete, self-contained
-    installable game, not a separate update -- classified here as Base Game.
-    content_type (0x20 full app / 0x23 delta) corroborates but is not the signal.
+    - Only a DELTA patch (0x41000000) is an incremental update that needs a base.
+      PS5 app images are cumulative, so a "subsequent" or "cumulative" full image
+      (e.g. Astro's Playroom shipped at 01.905.000) is a complete, self-contained
+      installable game, not a separate update -- classified here as Base Game.
+    - DLC / additional content carries GD_AC (0x02000000). This is heuristic: a
+      real base/homebrew image can set GD_AC *alongside* the base-content bit
+      GD_BASE (0x00020000) -- observed on the LibProsperoPkg homebrew sample,
+      flags 0x02020000 -- so we only treat GD_AC as DLC when GD_BASE is *not*
+      also set. This still lacks a confirmed retail add-on sample; treat DLC
+      here as best-effort.
+    - NON_GAME (0x04000000) marks a non-game application.
 
-    Note: reliable DLC (add-on) detection needs a confirmed sample, which we do
-    not have yet.
+    content_type (0x20 full app / 0x23 delta) corroborates but is not the signal.
     """
     if (content_flags & _FLAG_DELTA_PATCH) == _FLAG_DELTA_PATCH:
         return "Update"
+    if (content_flags & _FLAG_GD_AC) and not (content_flags & _FLAG_GD_BASE):
+        return "DLC"
+    if content_flags & _FLAG_NON_GAME:
+        return "App"
     return "Base Game"
 
 

@@ -164,6 +164,434 @@ def test_download_and_push():
             assert body["response"] == "-2135813882"
 
 
+def test_push_etahen_v1():
+    """etaHEN DPI v1: server sends a JSON object over raw TCP, reads {"res":"N"}."""
+    import json
+    import socket
+    import threading
+
+    with tempfile.TemporaryDirectory() as root:
+        _write_pkgs(root)
+        os.environ["PKG_DIRS"] = root
+        os.environ["ICON_DIR"] = os.path.join(root, "_icons")
+
+        import importlib
+        import app as app_module
+        importlib.reload(app_module)
+
+        from fastapi.testclient import TestClient
+
+        with TestClient(app_module.app) as client:
+            recs = client.get("/api/pkgs").json()["records"]
+            alpha = next(x for x in recs if x["title"] == "Alpha")
+            pkg_id = alpha["id"]
+
+            received = {}
+            srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            srv.bind(("127.0.0.1", 0))
+            srv.listen(1)
+            port = srv.getsockname()[1]
+
+            def accept():
+                conn, _ = srv.accept()
+                conn.settimeout(3)
+                data = b""
+                # etaHEN v1 does a single <=1024-byte read; grab the JSON payload.
+                try:
+                    while True:
+                        chunk = conn.recv(1024)
+                        if not chunk:
+                            break
+                        data += chunk
+                        try:
+                            json.loads(data.decode("utf-8"))
+                            break  # got a complete object
+                        except ValueError:
+                            continue
+                except (OSError, socket.timeout):
+                    pass
+                received["data"] = data.decode("utf-8", "replace")
+                conn.sendall(b'{"res":"0"}')
+                conn.close()
+
+            t = threading.Thread(target=accept)
+            t.start()
+
+            resp = client.post(
+                "/api/push",
+                json={
+                    "console_ip": "127.0.0.1",
+                    "console_port": port,
+                    "pkg_id": pkg_id,
+                    "protocol": "etahen_v1",
+                },
+            )
+            t.join(timeout=5)
+            srv.close()
+
+            body = resp.json()
+            assert body["ok"] is True, body
+            assert body["protocol"] == "etahen_v1"
+            assert body["code"] == 0
+            assert body["code_hex"] == "0x00000000"
+
+            # The console received a JSON object with the etaHEN field names.
+            sent = json.loads(received["data"])
+            assert sent["url"] == f"http://{body['server_ip']}:80/download/{pkg_id}"
+            assert "?" not in sent["url"]  # metadata is in fields, not query
+            assert sent["content_id"] == alpha["content_id"]
+            assert sent["content_name"] == "Alpha"
+            assert sent["icon_url"].startswith("http://")
+            assert "/icons/" in sent["icon_url"]
+
+
+def test_push_etahen_v2():
+    """etaHEN DPI v2: server POSTs form fields to /upload, reads status text."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import parse_qs
+
+    with tempfile.TemporaryDirectory() as root:
+        _write_pkgs(root)
+        os.environ["PKG_DIRS"] = root
+        os.environ["ICON_DIR"] = os.path.join(root, "_icons")
+
+        import importlib
+        import app as app_module
+        importlib.reload(app_module)
+
+        from fastapi.testclient import TestClient
+
+        received = {}
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(length).decode("utf-8")
+                received["path"] = self.path
+                received["fields"] = {k: v[0] for k, v in parse_qs(body).items()}
+                msg = b"SUCCESS: PKG installation started"
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(msg)))
+                self.end_headers()
+                self.wfile.write(msg)
+
+            def log_message(self, *a):  # silence
+                pass
+
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        port = httpd.server_address[1]
+        t = threading.Thread(target=httpd.handle_request)
+        t.start()
+
+        with TestClient(app_module.app) as client:
+            recs = client.get("/api/pkgs").json()["records"]
+            alpha = next(x for x in recs if x["title"] == "Alpha")
+            pkg_id = alpha["id"]
+
+            resp = client.post(
+                "/api/push",
+                json={
+                    "console_ip": "127.0.0.1",
+                    "console_port": port,
+                    "pkg_id": pkg_id,
+                    "protocol": "etahen_v2",
+                },
+            )
+            t.join(timeout=5)
+            httpd.server_close()
+
+            body = resp.json()
+            assert body["ok"] is True, body
+            assert body["protocol"] == "etahen_v2"
+            assert body["code"] == 0  # SUCCESS -> 0
+            assert body["response"].startswith("SUCCESS")
+
+            assert received["path"] == "/upload"
+            fields = received["fields"]
+            assert fields["url"] == f"http://{body['server_ip']}:80/download/{pkg_id}"
+            assert fields["content_id"] == alpha["content_id"]
+            assert fields["content_name"] == "Alpha"
+            assert fields["icon_url"].startswith("http://")
+
+
+def test_push_unknown_protocol():
+    with tempfile.TemporaryDirectory() as root:
+        _write_pkgs(root)
+        os.environ["PKG_DIRS"] = root
+        os.environ["ICON_DIR"] = os.path.join(root, "_icons")
+
+        import importlib
+        import app as app_module
+        importlib.reload(app_module)
+
+        from fastapi.testclient import TestClient
+
+        with TestClient(app_module.app) as client:
+            pkg_id = client.get("/api/pkgs").json()["records"][0]["id"]
+            resp = client.post(
+                "/api/push",
+                json={
+                    "console_ip": "127.0.0.1",
+                    "console_port": 9999,
+                    "pkg_id": pkg_id,
+                    "protocol": "bogus",
+                },
+            )
+            assert resp.status_code == 400
+            assert resp.json()["ok"] is False
+
+
+def test_push_remote_pkg():
+    """flatz ps4_remote_pkg_installer: POST /api/install {type:direct,packages:[url]}."""
+    import json
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    with tempfile.TemporaryDirectory() as root:
+        _write_pkgs(root)
+        os.environ["PKG_DIRS"] = root
+        os.environ["ICON_DIR"] = os.path.join(root, "_icons")
+
+        import importlib
+        import app as app_module
+        importlib.reload(app_module)
+
+        from fastapi.testclient import TestClient
+
+        received = {}
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(length).decode("utf-8")
+                received["path"] = self.path
+                received["json"] = json.loads(body)
+                msg = b'{ "status": "success", "task_id": 5, "title": "Alpha" }'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(msg)))
+                self.end_headers()
+                self.wfile.write(msg)
+
+            def log_message(self, *a):
+                pass
+
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        port = httpd.server_address[1]
+        t = threading.Thread(target=httpd.handle_request)
+        t.start()
+
+        with TestClient(app_module.app) as client:
+            recs = client.get("/api/pkgs").json()["records"]
+            alpha = next(x for x in recs if x["title"] == "Alpha")
+            pkg_id = alpha["id"]
+
+            resp = client.post(
+                "/api/push",
+                json={
+                    "console_ip": "127.0.0.1",
+                    "console_port": port,
+                    "pkg_id": pkg_id,
+                    "protocol": "remote_pkg",
+                },
+            )
+            t.join(timeout=5)
+            httpd.server_close()
+
+            body = resp.json()
+            assert body["ok"] is True, body
+            assert body["protocol"] == "remote_pkg"
+            assert body["code"] == 0  # success
+
+            assert received["path"] == "/api/install"
+            sent = received["json"]
+            assert sent["type"] == "direct"
+            assert sent["packages"] == [f"http://{body['server_ip']}:80/download/{pkg_id}"]
+            assert "?" not in sent["packages"][0]  # clean URL, no query params
+
+
+def test_push_remote_pkg_rejects_ps5():
+    """The PS4 installer can't handle PS5 packages -> server rejects with 400."""
+    from tests.test_pkg import build_ps5_pkg
+
+    with tempfile.TemporaryDirectory() as root:
+        param = {
+            "titleId": "PPSA00001",
+            "contentVersion": "01.00.000",
+            "localizedParameters": {"defaultLanguage": "en", "en": {"titleName": "PS5 Game"}},
+        }
+        with open(os.path.join(root, "PS5-GAME.pkg"), "wb") as f:
+            f.write(build_ps5_pkg(param))
+
+        os.environ["PKG_DIRS"] = root
+        os.environ["ICON_DIR"] = os.path.join(root, "_icons")
+
+        import importlib
+        import app as app_module
+        importlib.reload(app_module)
+
+        from fastapi.testclient import TestClient
+
+        with TestClient(app_module.app) as client:
+            recs = client.get("/api/pkgs").json()["records"]
+            assert recs and recs[0]["platform"] == "PS5"
+            pkg_id = recs[0]["id"]
+
+            resp = client.post(
+                "/api/push",
+                json={
+                    "console_ip": "127.0.0.1",
+                    "console_port": 12800,
+                    "pkg_id": pkg_id,
+                    "protocol": "remote_pkg",
+                },
+            )
+            assert resp.status_code == 400
+            body = resp.json()
+            assert body["ok"] is False
+            assert "PS5" in body["error"]
+
+
+def test_parse_remote_pkg_responses():
+    import importlib
+    import app as app_module
+    importlib.reload(app_module)
+
+    # Success -> 0.
+    assert app_module._parse_remote_pkg_response(
+        '{ "status": "success", "task_id": 3, "title": "X" }'
+    ) == (0, "0x00000000")
+    # Register fail: hex error_code (invalid JSON) -> signed int + hex.
+    assert app_module._parse_remote_pkg_response(
+        '{ "status": "fail", "error_code": 0x80B21106 }'
+    ) == (-2135813882, "0x80B21106")
+    # Param/prereq fail: valid JSON with an error string, no numeric code.
+    assert app_module._parse_remote_pkg_response(
+        '{ "status": "fail", "error": "Unsupported content type." }'
+    ) == (None, None)
+    assert app_module._parse_remote_pkg_response("") == (None, None)
+
+
+def test_push_goldhen():
+    """GoldHEN installer: JSON {id,contentUrl,contentName,iconPath} over raw TCP."""
+    import json
+    import socket
+    import threading
+
+    with tempfile.TemporaryDirectory() as root:
+        _write_pkgs(root)
+        os.environ["PKG_DIRS"] = root
+        os.environ["ICON_DIR"] = os.path.join(root, "_icons")
+
+        import importlib
+        import app as app_module
+        importlib.reload(app_module)
+
+        from fastapi.testclient import TestClient
+
+        with TestClient(app_module.app) as client:
+            recs = client.get("/api/pkgs").json()["records"]
+            alpha = next(x for x in recs if x["title"] == "Alpha")
+            pkg_id = alpha["id"]
+
+            received = {}
+            srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            srv.bind(("127.0.0.1", 0))
+            srv.listen(1)
+            port = srv.getsockname()[1]
+
+            def accept():
+                conn, _ = srv.accept()
+                conn.settimeout(3)
+                data = b""
+                try:
+                    while True:
+                        chunk = conn.recv(1024)
+                        if not chunk:
+                            break
+                        data += chunk
+                        try:
+                            json.loads(data.decode("utf-8"))
+                            break
+                        except ValueError:
+                            continue
+                except (OSError, socket.timeout):
+                    pass
+                received["data"] = data.decode("utf-8", "replace")
+                conn.sendall(b'{"status":"success"}')
+                conn.close()
+
+            t = threading.Thread(target=accept)
+            t.start()
+
+            resp = client.post(
+                "/api/push",
+                json={
+                    "console_ip": "127.0.0.1",
+                    "console_port": port,
+                    "pkg_id": pkg_id,
+                    "protocol": "goldhen",
+                },
+            )
+            t.join(timeout=5)
+            srv.close()
+
+            body = resp.json()
+            assert body["ok"] is True, body
+            assert body["protocol"] == "goldhen"
+            assert body["code"] == 0  # {"status":"success"} -> 0
+
+            sent = json.loads(received["data"])
+            # GoldHEN's BGFT-style field names (not the etaHEN shape).
+            assert sent["contentUrl"] == f"http://{body['server_ip']}:80/download/{pkg_id}"
+            assert "?" not in sent["contentUrl"]
+            assert sent["id"] == alpha["content_id"]
+            assert sent["contentName"] == "Alpha"
+            assert sent["iconPath"].startswith("http://")
+            assert "/icons/" in sent["iconPath"]
+
+
+def test_parse_goldhen_responses():
+    import importlib
+    import app as app_module
+    importlib.reload(app_module)
+
+    assert app_module._parse_goldhen_response('{"status":"success"}') == (0, "0x00000000")
+    assert app_module._parse_goldhen_response('{"res":"0"}') == (0, "0x00000000")
+    assert app_module._parse_goldhen_response('{"error_code":2157510663}') == (
+        -2137456633,
+        "0x80990007",
+    )
+    # Bare int fallback and unknown shapes.
+    assert app_module._parse_goldhen_response("0") == (0, "0x00000000")
+    assert app_module._parse_goldhen_response('{"whatever":1}') == (None, None)
+    assert app_module._parse_goldhen_response("") == (None, None)
+
+
+def test_parse_etahen_responses():
+    import importlib
+    import app as app_module
+    importlib.reload(app_module)
+
+    # v1: {"res":"N"} -> signed int + 32-bit hex.
+    assert app_module._parse_etahen_v1_response('{"res":"0"}') == (0, "0x00000000")
+    assert app_module._parse_etahen_v1_response('{"res":"-2135813882"}') == (
+        -2135813882,
+        "0x80B21106",
+    )
+    assert app_module._parse_etahen_v1_response("") == (None, None)
+    # Bare-int fallback if the reply isn't the expected JSON.
+    assert app_module._parse_etahen_v1_response("0") == (0, "0x00000000")
+
+    # v2: SUCCESS -> 0; FAILED text embeds the numeric code.
+    assert app_module._parse_etahen_v2_response("SUCCESS: started") == (0, "0x00000000")
+    assert app_module._parse_etahen_v2_response(
+        "FAILED: Install failed with error X, code -2135813882 (0x80B21106) for URL: y"
+    ) == (-2135813882, "0x80B21106")
+    assert app_module._parse_etahen_v2_response("") == (None, None)
+
+
 def test_parse_console_code():
     import importlib
     import app as app_module
