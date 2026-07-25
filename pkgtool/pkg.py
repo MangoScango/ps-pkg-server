@@ -414,19 +414,25 @@ class Pkg:
           - update     -> digest of the app playgo-chunk.dat entry (0x1008)
         A base and an update are compatible ("married") iff these match.
 
-        Returns None for DLC, PS5, or packages that don't carry the digest
-        (nothing to compare).
+        Base-vs-update is chosen by ``kind`` (from the SFO CATEGORY), NOT by the
+        header content_flags. The content_flags "kind" bits (0x0A000000 base /
+        0x02000000 update) are an fpkg convention; retail base games ship
+        content_flags 0x02000000 (which looks like "update"), so keying on them
+        made retail bases target the absent 0x1008 entry and return None -- which
+        broke grouping (the retail base couldn't marry its retail update).
+
+        Returns None for DLC, PS5, or packages that don't carry the digest.
         """
         if self.platform != "PS4":
             return None  # PS5 uses a different (split/merge) model
         if self.content_type == 0x1B:  # DLC / additional content
             return None
 
-        kind_bits = self.content_flags & _CONTENT_FLAGS_KIND_MASK
-        if kind_bits == _CONTENT_FLAGS_BASE:
-            target_id = ENTRY_PLAYGO_CHUNK_DAT
-        elif kind_bits == _CONTENT_FLAGS_UPDATE:
-            target_id = ENTRY_APP_PLAYGO_CHUNK_DAT
+        kind = self.kind
+        if kind in ("Base Game", "App"):
+            target_id = ENTRY_PLAYGO_CHUNK_DAT      # 0x1001
+        elif kind == "Update":
+            target_id = ENTRY_APP_PLAYGO_CHUNK_DAT  # 0x1008
         else:
             return None
 

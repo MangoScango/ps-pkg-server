@@ -266,19 +266,22 @@ def test_ps5_pkg_parse():
         assert pkg.read_icon0() == icon
 
 
-def build_ps4_marriage_pkg(kind, digest, content_id="UP0700-CUSA03388_00-DARKSOULS3000000", content_type=0x1A):
+def build_ps4_marriage_pkg(kind, digest, content_id="UP0700-CUSA03388_00-DARKSOULS3000000",
+                           content_type=0x1A, content_flags=None):
     """Build a PS4 CNT with a DIGESTS table so marriage_digest() can be tested.
 
-    kind: "base" (content_flags 0x0A..., playgo entry 0x1001) or
-          "update" (content_flags 0x02..., playgo entry 0x1008).
+    kind: "base" (category gd, playgo entry 0x1001) or
+          "update" (category gp, playgo entry 0x1008).
+    content_flags: override the header flags (defaults to the fpkg convention).
     The DIGESTS entry (0x0001) is at index 0; the playgo entry sits at index 2,
     so its 32-byte digest lives at digests_base + 2*32.
     """
     assert len(digest) == 32
     if kind == "base":
-        content_flags, playgo_id, category = 0x0A000000, 0x1001, "gd"
+        default_flags, playgo_id, category = 0x0A000000, 0x1001, "gd"
     else:
-        content_flags, playgo_id, category = 0x02000000, 0x1008, "gp"
+        default_flags, playgo_id, category = 0x02000000, 0x1008, "gp"
+    content_flags = default_flags if content_flags is None else content_flags
 
     sfo = build_sfo({"TITLE": "Test", "TITLE_ID": "CUSA03388", "VERSION": "01.00", "CATEGORY": category})
     digest_table = bytearray(3 * 32)  # one slot per entry (indices 0,1,2)
@@ -327,6 +330,19 @@ def test_marriage_digest():
         assert p.marriage_digest() == d.hex().upper()
     with Pkg.from_source(BytesSource(build_ps4_marriage_pkg("update", b"\xff" * 32))) as p:
         assert p.marriage_digest() == ("FF" * 32)
+
+
+def test_marriage_digest_retail_base_flags():
+    # Retail base games ship header content_flags 0x02000000 (which looks like
+    # "update" in the fpkg bit convention) but category "gd". marriage_digest must
+    # key on kind, not the flags, and read the 0x1001 digest -- otherwise the
+    # retail base returns None and can't marry its retail update.
+    d = bytes(range(32))
+    img = build_ps4_marriage_pkg("base", d, content_flags=0x02000000)
+    with Pkg.from_source(BytesSource(img)) as p:
+        assert p.kind == "Base Game"
+        assert p.content_flags == 0x02000000
+        assert p.marriage_digest() == d.hex().upper()
 
 
 def test_marriage_digest_excluded_cases():
