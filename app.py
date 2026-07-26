@@ -147,7 +147,7 @@ def _render_index(result: Optional[ScanResult]) -> str:
                       <div class="mstatus"></div>
                       <div class="mactions">
                         <a class="btn dl" href="/download/{html.escape(m.id)}" title="Download" download>&#8681;</a>
-                        <button class="btn push" onclick="push('{html.escape(m.id)}', this)" title="Send to console">&#10132;</button>
+                        <button class="btn push" onclick="push('{html.escape(m.id)}', this)" title="Install" aria-label="Install"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 8h9M8 4l4 4-4 4"/></svg></button>
                       </div>
                     </div>"""
                 )
@@ -162,7 +162,7 @@ def _render_index(result: Optional[ScanResult]) -> str:
                       <div class="gsub">{html.escape(g.platform or '?')} &middot; {html.escape(g.title_id)} &middot; {html.escape(g.region)}{(' &middot; build ' + html.escape(g.build)) if g.build else ''}</div>
                       <div class="gkinds">{_edition_badge(g.edition)}{kind_badges}</div>
                     </div>
-                    <button class="btn sendall" onclick="sendAll(event, this)" title="Send all to console">Send all</button>
+                    <button class="btn sendall" onclick="sendAll(event, this)" title="Install all">Install all</button>
                     <div class="chevron">&#9656;</div>
                   </summary>
                   <div class="members">{''.join(member_rows)}</div>
@@ -407,7 +407,7 @@ async function push(id, btn) {{
   const c = getConsole(); if (!c) return;
   const member = btn.closest('.member');
   const old = btn.innerHTML; btn.disabled = true; btn.innerHTML = '&hellip;';
-  setStatus(member, 'pushing', 'Sending\u2026');
+  setStatus(member, 'pushing', 'Installing\u2026');
   const j = await doPush(id, c.ip, c.port, c.proto);
   const r = resultLabel(j);
   setStatus(member, r.state, r.text, r.title);
@@ -424,8 +424,8 @@ async function sendAll(ev, btn) {{
   const old = btn.textContent; btn.disabled = true;
   for (let i = 0; i < members.length; i++) {{
     const m = members[i];
-    btn.textContent = 'Sending ' + (i + 1) + '/' + members.length;
-    setStatus(m, 'pushing', 'Sending\u2026');
+    btn.textContent = 'Installing ' + (i + 1) + '/' + members.length;
+    setStatus(m, 'pushing', 'Installing\u2026');
     const j = await doPush(m.dataset.id, c.ip, c.port, c.proto);
     const r = resultLabel(j);
     setStatus(m, r.state, r.text, r.title);

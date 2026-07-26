@@ -106,28 +106,26 @@ CONTENT_TYPES = {
     0x1E: "DP",  # delta patch
 }
 
-# PS5 content types (observed, for display only -- the reference does not
-# interpret content_type). 0x20 full application, 0x23 delta patch.
+# PS5 content types (LibProsperoPkg ProsperoPkgBuilder + ProsperoVolumeType).
+# Mirrors the PS4 scheme (0x1A/0x1B/0x1C/0x1E) shifted into the PS5 range.
+# content_type is the reliable base/DLC/patch signal on PS5 -- the content_flags
+# "kind" bits are deliberately set the same for base games and data DLC (the
+# reference builder's ContentFlagsFor writes GD_AC|GD_BASE for both), so we
+# classify on content_type instead.
 CONTENT_TYPES_PS5 = {
-    0x20: "GD",  # full application
+    0x20: "GD",  # full application (base game / app)
+    0x21: "AC",  # additional content with data (DLC), e.g. Shadow of the Erdtree
+    0x22: "AL",  # additional content, entitlement only / no data (license unlock)
     0x23: "DP",  # delta patch
 }
 
-# Content-flag bits (header 0x78). Shared by PS4 and PS5
-# (LibProsperoPkg ProsperoCntContentFlags / ProsperoNpDrmContentInfo / PS4PKG.bt).
-# Patch bits (note DELTA/CUMULATIVE share the SUBSEQUENT bit, so ordering matters
-# when classifying -- test the more specific masks first):
-_FLAG_FIRST_PATCH = 0x00100000
-_FLAG_SUBSEQUENT_PATCH = 0x40000000
-_FLAG_DELTA_PATCH = 0x41000000
-_FLAG_CUMULATIVE_PATCH = 0x60000000
-# PS5 content-classification bits (LibProsperoPkg ProsperoCntContentFlags):
-_FLAG_GD_BASE = 0x00020000   # base application content
-_FLAG_PATCHGO = 0x00200000
-_FLAG_REMASTER = 0x00400000
-_FLAG_PS_CLOUD = 0x00800000
-_FLAG_GD_AC = 0x02000000     # additional content (DLC)
-_FLAG_NON_GAME = 0x04000000  # non-game application
+# Content-flag bits (header 0x78). Only the flags we actually rely on -- the
+# LibProsperoPkg "content classification" bits (GD_BASE 0x00020000 / GD_AC
+# 0x02000000) proved inconsistent across real samples (retail DLC and retail
+# base games both ship 0x02020000), so classification uses ``content_type``
+# instead and these are not kept as constants.
+_FLAG_DELTA_PATCH = 0x41000000    # SUBSEQUENT|FIRST -- see PS4PKG.bt / LibProsperoPkg
+_FLAG_NON_GAME = 0x04000000       # non-game application
 
 # Header flags field (offset 0x04). Bit 31 = FINALIZED: set on retail (and PS5
 # debug) packages that went through Sony finalization; fake/homebrew fpkgs are
@@ -354,7 +352,7 @@ class Pkg:
 
     @property
     def kind(self) -> str:
-        """High-level package kind: Base Game / Update / DLC / App / Other."""
+        """High-level package kind: Game / Update / DLC / App / Other."""
         if self.platform == "PS5":
             return classify_kind_ps5(self.content_flags, self.content_type)
         # PS4: base vs update needs the SFO CATEGORY (gd* vs gp*); both share
@@ -429,7 +427,7 @@ class Pkg:
             return None
 
         kind = self.kind
-        if kind in ("Base Game", "App"):
+        if kind in ("Game", "App"):
             target_id = ENTRY_PLAYGO_CHUNK_DAT      # 0x1001
         elif kind == "Update":
             target_id = ENTRY_APP_PLAYGO_CHUNK_DAT  # 0x1008
@@ -703,15 +701,15 @@ def parse_sfo(data: bytes) -> Dict[str, object]:
 
 
 def classify_kind(category: Optional[str], content_type: int) -> str:
-    """Classify a package as Base Game / Update / DLC / App / Other.
+    """Classify a package as Game / Update / DLC / App / Other.
 
     Primary signal is the SFO CATEGORY code (see LibOrbisPkg SfoData.SfoTypes):
       - ``gp*`` -> Update (game/app patch)
       - ``ac``  -> DLC (additional content)
-      - ``gd``  -> Base Game
+      - ``gd``  -> Game
       - ``gd*`` (gda/gdc/gdd/gde/gdk/gdl/...) -> App (non-game applications)
     content_type is a fallback: AC/AL (0x1B/0x1C) -> DLC, DP (0x1E) -> Update,
-    GD (0x1A) -> Base Game.
+    GD (0x1A) -> Game.
     """
     c = (category or "").lower()
     if c.startswith("gp"):
@@ -719,7 +717,7 @@ def classify_kind(category: Optional[str], content_type: int) -> str:
     if c == "ac":
         return "DLC"
     if c == "gd" or c == "gc" or c == "bd":
-        return "Base Game"
+        return "Game"
     if c.startswith("gd"):
         return "App"
     # Fallbacks based on content_type when CATEGORY is absent/unknown.
@@ -728,38 +726,43 @@ def classify_kind(category: Optional[str], content_type: int) -> str:
     if content_type == 0x1E:  # DP (delta patch)
         return "Update"
     if content_type == 0x1A:  # GD
-        return "Base Game"
+        return "Game"
     return "Other"
 
 
 def classify_kind_ps5(content_flags: int, content_type: int) -> str:
-    """Classify a PS5 package as Update / DLC / App / Base Game.
+    """Classify a PS5 package as Update / DLC / App / Game.
 
-    Uses the content-flag bits (LibProsperoPkg ProsperoCntContentFlags /
-    ProsperoNpDrmContentInfo), which is the reference/console signal -- not
-    content_type, which the reference does not interpret.
+    On PS5, ``content_type`` is the reliable base/DLC/patch signal -- it mirrors
+    the PS4 convention (0x20 GD / 0x21 AC / 0x22 AL / 0x23 DP), and this matches
+    LibProsperoPkg's ``ProsperoPkgBuilder.ContentTypeFor``. The ``content_flags``
+    "kind" bits (GD_BASE 0x00020000 / GD_AC 0x02000000) are deliberately set the
+    same way for base games and data DLC by that same builder:
+    ``ContentFlagsFor(_) = GD_AC | GD_BASE`` for both Application and
+    AdditionalContentData (only AdditionalContentNoData / AL yields 0). Real
+    retail data agrees -- Elden Ring: Shadow of the Erdtree ships flags
+    ``0x02020000`` with ``content_type=0x21``, indistinguishable from a base
+    game on flags alone. So we key on content_type and use content_flags only
+    for patch (delta) detection and non-game apps.
 
-    - Only a DELTA patch (0x41000000) is an incremental update that needs a base.
-      PS5 app images are cumulative, so a "subsequent" or "cumulative" full image
-      (e.g. Astro's Playroom shipped at 01.905.000) is a complete, self-contained
-      installable game, not a separate update -- classified here as Base Game.
-    - DLC / additional content carries GD_AC (0x02000000). This is heuristic: a
-      real base/homebrew image can set GD_AC *alongside* the base-content bit
-      GD_BASE (0x00020000) -- observed on the LibProsperoPkg homebrew sample,
-      flags 0x02020000 -- so we only treat GD_AC as DLC when GD_BASE is *not*
-      also set. This still lacks a confirmed retail add-on sample; treat DLC
-      here as best-effort.
-    - NON_GAME (0x04000000) marks a non-game application.
-
-    content_type (0x20 full app / 0x23 delta) corroborates but is not the signal.
+    - ``content_type == 0x21`` (AC, data DLC) or ``0x22`` (AL, entitlement-only)
+      -> DLC / additional content.
+    - ``content_type == 0x23`` or the DELTA_PATCH flag pattern -> Update. PS5
+      full images are cumulative -- a "subsequent" or "cumulative" full image
+      (Astro's Playroom shipping at 01.905.000, Balatro, etc.) is a complete,
+      self-contained installable game, not a separate update.
+    - NON_GAME (0x04000000) -> App (non-game application).
+    - Everything else -> Game.
     """
-    if (content_flags & _FLAG_DELTA_PATCH) == _FLAG_DELTA_PATCH:
+    # Delta patch: either the content_type (0x23) or the DELTA_PATCH flag
+    # combination (SUBSEQUENT|FIRST = 0x41000000). Retail deltas set both.
+    if content_type == 0x23 or (content_flags & _FLAG_DELTA_PATCH) == _FLAG_DELTA_PATCH:
         return "Update"
-    if (content_flags & _FLAG_GD_AC) and not (content_flags & _FLAG_GD_BASE):
+    if content_type in (0x21, 0x22):
         return "DLC"
     if content_flags & _FLAG_NON_GAME:
         return "App"
-    return "Base Game"
+    return "Game"
 
 
 def detect_edition(fih_signed: Optional[int], header_flags: int) -> str:

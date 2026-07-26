@@ -153,7 +153,7 @@ def test_pkg_parse_metadata():
         assert pkg.title_id == "CUSA12345"
         assert pkg.version == "01.00"
         assert pkg.content_type_name == "GD"
-        assert pkg.kind == "Base Game"
+        assert pkg.kind == "Game"
         assert pkg.region == "US"
         # build_pkg sets no FINALIZED flag -> treated as a homebrew fpkg.
         assert pkg.edition == "fpkg"
@@ -257,8 +257,8 @@ def test_ps5_pkg_parse():
         assert pkg.title_id == "PPSA19639"
         # contentVersion is preferred over masterVersion.
         assert pkg.version == "01.024.000"
-        # content_type 0x20 = full application -> Base Game, despite any patch flags.
-        assert pkg.kind == "Base Game"
+        # content_type 0x20 = full application -> Game, despite any patch flags.
+        assert pkg.kind == "Game"
         assert pkg.region == "US"
         assert pkg.content_id == "UP4433-PPSA19639_00-CPREVIEW00000000"
         assert pkg.edition == "Retail"  # FIH signed byte 0x80
@@ -323,7 +323,7 @@ def test_marriage_digest():
     d = bytes(range(32))
     with Pkg.from_source(BytesSource(build_ps4_marriage_pkg("base", d))) as p:
         assert p.platform == "PS4"
-        assert p.kind == "Base Game"
+        assert p.kind == "Game"
         assert p.marriage_digest() == d.hex().upper()
     with Pkg.from_source(BytesSource(build_ps4_marriage_pkg("update", d))) as p:
         assert p.kind == "Update"
@@ -340,7 +340,7 @@ def test_marriage_digest_retail_base_flags():
     d = bytes(range(32))
     img = build_ps4_marriage_pkg("base", d, content_flags=0x02000000)
     with Pkg.from_source(BytesSource(img)) as p:
-        assert p.kind == "Base Game"
+        assert p.kind == "Game"
         assert p.content_flags == 0x02000000
         assert p.marriage_digest() == d.hex().upper()
 
@@ -404,34 +404,49 @@ def test_ps5_full_app_with_patch_flags_is_base():
     }
     img = build_ps5_pkg(param, content_flags=0x42420000, content_type=0x20)
     with Pkg.from_source(BytesSource(img)) as pkg:
-        assert pkg.kind == "Base Game"
+        assert pkg.kind == "Game"
         assert pkg.version == "01.905.000"
 
 
-def test_ps5_kind_flag_classification():
+def test_ps5_kind_classification():
     from pkgtool.pkg import classify_kind_ps5
 
-    # GD_AC (0x02000000) without GD_BASE -> DLC (best-effort add-on detection).
-    assert classify_kind_ps5(0x02000000, 0x20) == "DLC"
-    # GD_AC alongside GD_BASE (0x00020000) is a base/homebrew image, not DLC --
-    # this is the real LibProsperoPkg homebrew sample (flags 0x02020000).
-    assert classify_kind_ps5(0x02020000, 0x20) == "Base Game"
-    # NON_GAME (0x04000000) -> App.
-    assert classify_kind_ps5(0x04000000, 0x20) == "App"
-    # DELTA still wins over everything.
+    # content_type is the primary signal on PS5 (LibProsperoPkg convention):
+    # 0x21 = AC (additional content with data / DLC), regardless of flags --
+    # retail DLC (Elden Ring: Shadow of the Erdtree) ships 0x02020000 (BASE|AC).
+    assert classify_kind_ps5(0x02020000, 0x21) == "DLC"
+    assert classify_kind_ps5(0x00000000, 0x21) == "DLC"
+    # 0x22 = AL (additional content, entitlement only / no data). The reference
+    # builder writes content_flags = 0 for these; still classified as DLC.
+    assert classify_kind_ps5(0x00000000, 0x22) == "DLC"
+    # 0x23 or the DELTA_PATCH flag combination -> Update.
     assert classify_kind_ps5(0x41000000, 0x23) == "Update"
+    assert classify_kind_ps5(0x00000000, 0x23) == "Update"
+    assert classify_kind_ps5(0x41000000, 0x20) == "Update"  # flag-only fallback
+    # NON_GAME (0x04000000) on a full app -> App.
+    assert classify_kind_ps5(0x04000000, 0x20) == "App"
+    # Full app (content_type 0x20) with GD_BASE|GD_AC bits set is still a base
+    # game (real LibProsperoPkg homebrew: flags 0x02020000). content_flags
+    # kind bits are ignored.
+    assert classify_kind_ps5(0x02020000, 0x20) == "Game"
+    # Full app with GD_AC alone (Minecraft homebrew, flags 0x0A000000) is a
+    # base game -- content_type=0x20 wins, GD_AC alone doesn't imply DLC.
+    assert classify_kind_ps5(0x0A000000, 0x20) == "Game"
     # Plain full app.
-    assert classify_kind_ps5(0x00000000, 0x20) == "Base Game"
+    assert classify_kind_ps5(0x00000000, 0x20) == "Game"
 
 
 def test_ps5_dlc_pkg_kind():
+    # A retail PS5 DLC has content_type 0x21 (AC) regardless of what content_flags
+    # look like -- Elden Ring's Shadow of the Erdtree ships 0x02020000 (BASE|AC).
     param = {
-        "titleId": "PPSA19639",
+        "titleId": "PPSA04610",
         "localizedParameters": {"defaultLanguage": "en-US", "en-US": {"titleName": "Add-on"}},
     }
-    img = build_ps5_pkg(param, content_flags=0x02000000)
+    img = build_ps5_pkg(param, content_flags=0x02020000, content_type=0x21)
     with Pkg.from_source(BytesSource(img)) as pkg:
         assert pkg.kind == "DLC"
+        assert pkg.content_type_name == "AC"
 
 
 def test_fih_bad_version_rejected():
@@ -471,7 +486,7 @@ def test_kind_classification():
     from pkgtool.pkg import classify_kind
 
     # CATEGORY-driven
-    assert classify_kind("gd", 0x1A) == "Base Game"
+    assert classify_kind("gd", 0x1A) == "Game"
     assert classify_kind("gp", 0x1A) == "Update"  # patch shares content_type GD
     assert classify_kind("gpc", 0x1A) == "Update"
     assert classify_kind("ac", 0x1B) == "DLC"
@@ -479,7 +494,7 @@ def test_kind_classification():
     # content_type fallback when CATEGORY missing
     assert classify_kind(None, 0x1B) == "DLC"
     assert classify_kind(None, 0x1E) == "Update"
-    assert classify_kind(None, 0x1A) == "Base Game"
+    assert classify_kind(None, 0x1A) == "Game"
     assert classify_kind("", 0x99) == "Other"
 
 

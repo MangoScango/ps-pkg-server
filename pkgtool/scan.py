@@ -62,7 +62,7 @@ class ScanResult:
 
 # Ordering used to pick a group's representative and to sort members within a
 # group: base game first, then update, then DLC, then everything else.
-_KIND_PRIORITY = {"Base Game": 0, "App": 1, "Update": 2, "DLC": 3}
+_KIND_PRIORITY = {"Game": 0, "App": 1, "Update": 2, "DLC": 3}
 
 
 def _kind_rank(kind: str) -> int:
@@ -137,7 +137,7 @@ def _mark_compat(members: List[PkgRecord]) -> None:
     title has no base game to compare against.
     """
     base_digests = {
-        m.marriage for m in members if m.kind == "Base Game" and m.marriage
+        m.marriage for m in members if m.kind == "Game" and m.marriage
     }
     if not base_digests:
         return
@@ -199,7 +199,7 @@ def _split_title(key: str, members: List[PkgRecord]) -> List["PkgGroup"]:
     # Partition into build-specific members (base/update carrying a digest) and
     # shared members (DLC, PS5, unreadable) that aren't tied to a build.
     def _build_key(m: PkgRecord):
-        return m.marriage if (m.marriage and m.kind in ("Base Game", "Update")) else None
+        return m.marriage if (m.marriage and m.kind in ("Game", "Update")) else None
 
     by_digest: Dict[str, List[PkgRecord]] = {}
     shared: List[PkgRecord] = []
@@ -222,7 +222,7 @@ def _split_title(key: str, members: List[PkgRecord]) -> List["PkgGroup"]:
     attached_shared = False
     for digest, subm in by_digest.items():
         group_members = list(subm)
-        if any(m.kind == "Base Game" for m in subm):
+        if any(m.kind == "Game" for m in subm):
             group_members += shared
             attached_shared = True
         groups.append(_make_group(key, group_members, build=digest[:7]))

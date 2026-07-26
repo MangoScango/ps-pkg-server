@@ -711,20 +711,20 @@ def test_grouping_representative():
     records = [
         rec("Game DLC Pack", "DLC", icon="dlc.png"),
         rec("Game Update", "Update", icon="update.png"),
-        rec("Game", "Base Game", icon=None),
+        rec("Game", "Game", icon=None),
     ]
     groups = group_by_title_id(records)
     assert len(groups) == 1
     g = groups[0]
     # Representative kind is the base game (highest priority).
-    assert g.kind == "Base Game"
+    assert g.kind == "Game"
     # Title derived from highest-priority member that has one.
     assert g.title == "Game"
     # Icon falls back to first member (in priority order) that has one -> update.
     assert g.icon == "update.png"
     # Members sorted base > update > dlc.
-    assert [m.kind for m in g.members] == ["Base Game", "Update", "DLC"]
-    assert g.kinds == ["Base Game", "Update", "DLC"]
+    assert [m.kind for m in g.members] == ["Game", "Update", "DLC"]
+    assert g.kinds == ["Game", "Update", "DLC"]
 
 
 def test_group_compat():
@@ -752,13 +752,13 @@ def test_group_compat():
     b = "BB" * 32
 
     # Matching digests -> single group, update married.
-    gs = group_by_title_id([rec("Base Game", a), rec("Update", a)])
+    gs = group_by_title_id([rec("Game", a), rec("Update", a)])
     assert len(gs) == 1
     assert next(m for m in gs[0].members if m.kind == "Update").compat == "married"
 
     # Base + non-matching update (DS3 symptom): the title splits into two build
     # groups, but the orphan update is still flagged mismatch.
-    gs = group_by_title_id([rec("Base Game", a), rec("Update", b)])
+    gs = group_by_title_id([rec("Game", a), rec("Update", b)])
     assert len(gs) == 2
     upd = next(m for g in gs for m in g.members if m.kind == "Update")
     assert upd.compat == "mismatch"
@@ -795,7 +795,7 @@ def test_group_split_by_build():
     cid = "UP0700-CUSA03388_00-DARKSOULS3000000"
 
     # Single build + DLC -> one combined group, build tag shown (there's a base).
-    gs = group_by_title_id([rec("Base Game", a, cid), rec("Update", a, cid), rec("DLC", None, cid)])
+    gs = group_by_title_id([rec("Game", a, cid), rec("Update", a, cid), rec("DLC", None, cid)])
     assert len(gs) == 1
     assert gs[0].count == 3
     assert gs[0].build == "AAAAAAA"
@@ -803,9 +803,9 @@ def test_group_split_by_build():
     # Two builds (A, B) + a DLC -> two build groups; the DLC attaches to BOTH
     # (each has a base), so it's duplicated and there is no separate group.
     recs = [
-        rec("Base Game", a, cid),
+        rec("Game", a, cid),
         rec("Update", a, cid),
-        rec("Base Game", b, cid),
+        rec("Game", b, cid),
         rec("Update", b, cid),
         rec("DLC", None, cid),
     ]
@@ -813,18 +813,18 @@ def test_group_split_by_build():
     assert len(gs) == 2
     assert sorted(g.build for g in gs) == ["AAAAAAA", "BBBBBBB"]
     for g in gs:
-        assert sorted(m.kind for m in g.members) == ["Base Game", "DLC", "Update"]
-        digs = {m.marriage for m in g.members if m.kind in ("Base Game", "Update")}
+        assert sorted(m.kind for m in g.members) == ["DLC", "Game", "Update"]
+        digs = {m.marriage for m in g.members if m.kind in ("Game", "Update")}
         assert len(digs) == 1  # one coherent marriage per group
         assert next(m for m in g.members if m.kind == "Update").compat == "married"
 
     # Base A + orphan update B + DLC: A gets the DLC; B is an update-only group,
     # still flagged mismatch, with its build tag shown.
-    gs = group_by_title_id([rec("Base Game", a, cid), rec("Update", b, cid), rec("DLC", None, cid)])
+    gs = group_by_title_id([rec("Game", a, cid), rec("Update", b, cid), rec("DLC", None, cid)])
     assert len(gs) == 2
     ga = next(g for g in gs if g.build == "AAAAAAA")
     gb = next(g for g in gs if g.build == "BBBBBBB")
-    assert sorted(m.kind for m in ga.members) == ["Base Game", "DLC"]
+    assert sorted(m.kind for m in ga.members) == ["DLC", "Game"]
     assert [m.kind for m in gb.members] == ["Update"]
     assert gb.members[0].compat == "mismatch"
 
