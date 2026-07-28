@@ -491,6 +491,8 @@ def test_kind_classification():
     assert classify_kind("gpc", 0x1A) == "Update"
     assert classify_kind("ac", 0x1B) == "DLC"
     assert classify_kind("gdc", 0x1A) == "App"
+    # gdo = PS2 Classic (PS2 game running on PS4 via the built-in emulator).
+    assert classify_kind("gdo", 0x1A) == "Game"
     # content_type fallback when CATEGORY missing
     assert classify_kind(None, 0x1B) == "DLC"
     assert classify_kind(None, 0x1E) == "Update"

@@ -707,6 +707,7 @@ def classify_kind(category: Optional[str], content_type: int) -> str:
       - ``gp*`` -> Update (game/app patch)
       - ``ac``  -> DLC (additional content)
       - ``gd``  -> Game
+      - ``gdo`` -> Game (PS2 Classic; runs under PS4's built-in PS2 emulator
       - ``gd*`` (gda/gdc/gdd/gde/gdk/gdl/...) -> App (non-game applications)
     content_type is a fallback: AC/AL (0x1B/0x1C) -> DLC, DP (0x1E) -> Update,
     GD (0x1A) -> Game.
@@ -716,7 +717,7 @@ def classify_kind(category: Optional[str], content_type: int) -> str:
         return "Update"
     if c == "ac":
         return "DLC"
-    if c == "gd" or c == "gc" or c == "bd":
+    if c == "gd" or c == "gc" or c == "bd" or c == "gdo":
         return "Game"
     if c.startswith("gd"):
         return "App"

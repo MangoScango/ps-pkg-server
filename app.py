@@ -243,7 +243,7 @@ def _render_index(result: Optional[ScanResult]) -> str:
   .console #cip {{ width: 130px; }}
   .console #cport {{ width: 72px; }}
   .badge {{ font-size: 10px; font-weight: 600; padding: 2px 7px; border-radius: 10px; white-space: nowrap; text-transform: uppercase; letter-spacing: .03em; background: #374151; color: #d1d5db; }}
-  .badge.kind-basegame {{ background: #14532d; color: #86efac; }}
+  .badge.kind-game {{ background: #14532d; color: #86efac; }}
   .badge.kind-update {{ background: #1e3a5f; color: #93c5fd; }}
   .badge.kind-dlc {{ background: #4c1d95; color: #c4b5fd; }}
   .badge.kind-app {{ background: #78350f; color: #fcd34d; }}
