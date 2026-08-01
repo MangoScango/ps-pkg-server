@@ -315,7 +315,6 @@ def _render_index(result: Optional[ScanResult]) -> str:
         <option value="etahen_v1">etaHEN DPI v1</option>
         <option value="etahen_v2">etaHEN DPI v2</option>
         <option value="remote_pkg">PS4 Remote PKG Installer</option>
-        <option value="goldhen">PS4 GoldHEN</option>
       </select>
       <input id="cip" placeholder="Console IP" autocomplete="off" inputmode="decimal">
       <input id="cport" placeholder="Port" value="9040" autocomplete="off" inputmode="numeric">
@@ -341,7 +340,7 @@ async function rescan(btn) {{
 
 // Default listen ports per protocol. Switching protocol updates the port only
 // when the user hasn't set a custom one (empty or still a known default).
-const PROTO_PORTS = {{ ezremote: 9040, etahen_v1: 9090, etahen_v2: 12800, remote_pkg: 12800, goldhen: 9090 }};
+const PROTO_PORTS = {{ ezremote: 9040, etahen_v1: 9090, etahen_v2: 12800, remote_pkg: 12800 }};
 (() => {{
   const proto = document.getElementById('cproto');
   const port = document.getElementById('cport');
@@ -588,9 +587,6 @@ def _serve_split(parts, filename: str, request: Request):
 # "remote_pkg" is flatz's ps4_remote_pkg_installer (and the OOP fork):
 #   HTTP :12800, POST /api/install {"type":"direct","packages":[url]}, JSON reply.
 #   PS4-only: it fetches param.sfo/icon0 by range and rejects PS5 param.json.
-# "goldhen" is GoldHEN's embedded installer:
-#   raw TCP :9090, JSON {"id","contentUrl","contentName","iconPath"} (BGFT field
-#   names -- not the etaHEN shape), JSON reply.
 # All of them drive the console's own HTTP downloader against /download/{id}.
 PUSH_PROTOCOLS = (
     "ezremote",
@@ -598,7 +594,6 @@ PUSH_PROTOCOLS = (
     "etahen_v1",
     "etahen_v2",
     "remote_pkg",
-    "goldhen",
 )
 
 
@@ -656,17 +651,6 @@ def api_push(req: PushRequest, request: Request) -> JSONResponse:
             # range-capable stream, so a single-element array is enough.
             url = f"http://{authority}/download/{req.pkg_id}"
             result = _push_remote_pkg(req.console_ip, req.console_port, url)
-        elif protocol == "goldhen":
-            # GoldHEN uses BGFT-style field names (id/contentUrl/contentName/
-            # iconPath), distinct from the etaHEN payload shape.
-            url = f"http://{authority}/download/{req.pkg_id}"
-            payload = {
-                "id": record.content_id or "",
-                "contentUrl": url,
-                "contentName": name,
-                "iconPath": icon_abs,
-            }
-            result = _push_goldhen(req.console_ip, req.console_port, payload)
         else:
             # etaHEN carries metadata in dedicated fields, so the URL stays clean
             # and the icon must be absolute for the console to fetch it.
@@ -790,22 +774,6 @@ def _push_remote_pkg(console_ip: str, console_port: int, download_url: str) -> d
     return {"response": response, "code": code, "code_hex": code_hex}
 
 
-def _push_goldhen(console_ip: str, console_port: int, payload: dict) -> dict:
-    """GoldHEN embedded installer: send a JSON object over raw TCP, read a JSON
-    reply.
-
-    The payload uses SceBgftDownloadParam field names (id/contentUrl/contentName/
-    iconPath). It's sent in a single write and the reply is read until the peer
-    closes (or the timeout elapses).
-    """
-    body = json.dumps(payload, separators=(",", ":"))
-    with socket.create_connection((console_ip, console_port), timeout=5) as sock:
-        sock.sendall(body.encode("utf-8"))
-        response = _read_console_response(sock)
-    code, code_hex = _parse_goldhen_response(response)
-    return {"response": response, "code": code, "code_hex": code_hex}
-
-
 def _read_console_response(sock: socket.socket) -> str:
     """Read the console's reply (the install result code as a decimal string).
 
@@ -906,38 +874,4 @@ def _parse_remote_pkg_response(response: str):
         return None, None
     if isinstance(obj, dict) and obj.get("status") == "success":
         return 0, "0x00000000"
-    return None, None
-
-
-def _parse_goldhen_response(response: str):
-    """Best-effort (int_code, hex_string) from a GoldHEN reply.
-
-    GoldHEN's exact reply schema isn't firmly documented (the reference sender
-    just logs it), so we accept the common shapes: a numeric ``res``/``error``/
-    ``error_code``/``code`` field, a ``status: success``, or a bare integer.
-    Anything else yields (None, None) and the UI reports "sent" without a code.
-    """
-    if not response:
-        return None, None
-    try:
-        obj = json.loads(response)
-    except ValueError:
-        return _parse_console_code(response)  # maybe a bare integer
-    if isinstance(obj, int):  # a bare JSON integer result code
-        code = obj - 0x100000000 if obj >= 0x80000000 else obj
-        return code, f"0x{code & 0xFFFFFFFF:08X}"
-    if isinstance(obj, dict):
-        for key in ("res", "error_code", "error", "code"):
-            value = obj.get(key)
-            if value is None:
-                continue
-            try:
-                code = int(value)
-            except (ValueError, TypeError):
-                continue
-            if code >= 0x80000000:  # unsigned 32-bit -> signed
-                code -= 0x100000000
-            return code, f"0x{code & 0xFFFFFFFF:08X}"
-        if obj.get("status") in ("success", "ok", 0, "0"):
-            return 0, "0x00000000"
     return None, None
