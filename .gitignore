@@ -16,3 +16,4 @@ _[!_]*.py
 
 # Local config
 .env
+*.pkg

@@ -215,17 +215,22 @@ def build_cnt(entries_data, content_id, content_type=0x20, content_flags=0, pack
 
 
 def build_ps5_pkg(param_obj, icon0=b"", content_id="UP4433-PPSA19639_00-CPREVIEW00000000",
-                  content_flags=0, signed=0x80, content_type=0x20):
+                  content_flags=0, signed=0x80, content_type=0x20, license=False):
     """Build a PS5 \\x7FFIH image wrapping a CNT with param.json (0x2000).
 
     signed: FIH signed byte (0x80 = retail, 0x00 = debug).
     content_type: 0x20 full app, 0x23 delta patch.
+    license: when True, add the NpDrm license.dat (0x400) / license.info (0x401)
+        entries (present on retail and fpkg, absent on Debug builds).
     """
     import json
 
     entries = [(0x2000, json.dumps(param_obj).encode("utf-8"))]
     if icon0:
         entries.append((0x1200, icon0))
+    if license:
+        entries.append((0x400, b"license.dat"))
+        entries.append((0x401, b"license.info"))
     cnt = build_cnt(entries, content_id, content_type=content_type, content_flags=content_flags)
 
     cnt_base = 0x10000  # FIH header region, then the embedded CNT
@@ -359,9 +364,15 @@ def test_marriage_digest_excluded_cases():
 def test_edition_detection():
     from pkgtool.pkg import detect_edition
 
-    # PS5 finalized image: signed byte is definitive.
+    # PS5 finalized image: signed byte 0x80 is definitively retail (license
+    # entries, always present on retail, don't change that).
     assert detect_edition(0x80, 0) == "Retail"
+    assert detect_edition(0x80, 0, has_license=True) == "Retail"
+    # Non-retail FIH (0x00): split on the NpDrm license entries -- present -> fpkg,
+    # absent -> Debug.
     assert detect_edition(0x00, 0) == "Debug"
+    assert detect_edition(0x00, 0, has_license=False) == "Debug"
+    assert detect_edition(0x00, 0, has_license=True) == "fpkg"
     # Bare CNT / PS4: FINALIZED flag (bit 31) at header 0x04.
     assert detect_edition(None, 0x83020001) == "Retail"
     assert detect_edition(None, 0x00000001) == "fpkg"
@@ -369,10 +380,29 @@ def test_edition_detection():
 
 
 def test_ps5_debug_edition():
+    # A non-retail FIH (signed byte 0x00) with no NpDrm license entries -> Debug.
     param = {"titleId": "PPSA00001", "localizedParameters": {"defaultLanguage": "en", "en": {"titleName": "Dbg"}}}
     img = build_ps5_pkg(param, signed=0x00)
     with Pkg.from_source(BytesSource(img)) as pkg:
         assert pkg.edition == "Debug"
+
+
+def test_ps5_fpkg_edition():
+    # A non-retail FIH (signed byte 0x00) carrying the NpDrm license.dat /
+    # license.info entries -> fpkg.
+    param = {"titleId": "PPSA00001", "localizedParameters": {"defaultLanguage": "en", "en": {"titleName": "Fake"}}}
+    img = build_ps5_pkg(param, signed=0x00, license=True)
+    with Pkg.from_source(BytesSource(img)) as pkg:
+        assert pkg.edition == "fpkg"
+
+
+def test_ps5_retail_edition_with_license():
+    # Retail packages carry license entries too, but the 0x80 signed byte makes
+    # them Retail regardless.
+    param = {"titleId": "PPSA00001", "localizedParameters": {"defaultLanguage": "en", "en": {"titleName": "Retail"}}}
+    img = build_ps5_pkg(param, signed=0x80, license=True)
+    with Pkg.from_source(BytesSource(img)) as pkg:
+        assert pkg.edition == "Retail"
 
 
 def test_ps5_delta_patch_kind():

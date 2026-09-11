@@ -76,6 +76,8 @@ ENTRY_IMAGE_KEY = 0x00000020
 ENTRY_GENERAL_DIGESTS = 0x00000080
 ENTRY_METAS = 0x00000100
 ENTRY_ENTRY_NAMES = 0x00000200
+ENTRY_LICENSE_DAT = 0x00000400     # NpDrm license.dat  (present in retail + fpkg)
+ENTRY_LICENSE_INFO = 0x00000401    # NpDrm license.info (present in retail + fpkg)
 ENTRY_IMAGEDIGS = 0x0000040A    # imagedigs.dat (present in every finalized PS5 image)
 ENTRY_PARAM_SFO = 0x00001000    # PS4 param.sfo
 ENTRY_PIC1_PNG = 0x00001006
@@ -127,11 +129,13 @@ CONTENT_TYPES_PS5 = {
 _FLAG_DELTA_PATCH = 0x41000000    # SUBSEQUENT|FIRST -- see PS4PKG.bt / LibProsperoPkg
 _FLAG_NON_GAME = 0x04000000       # non-game application
 
-# Header flags field (offset 0x04). Bit 31 = FINALIZED: set on retail (and PS5
-# debug) packages that went through Sony finalization; fake/homebrew fpkgs are
-# not finalized. (PS4PKG.bt PKG_FLAGS_FINALIZED / LibOrbisPkg PKG_FLAG_FINALIZED.)
+# Header flags field (offset 0x04). Bit 31 = FINALIZED: set on packages that
+# went through Sony finalization, unset otherwise. Used to tell Retail from fpkg
+# on the PS4 / bare-CNT path (PS5 FIH images use the 0x05 signed byte instead).
+# (PS4PKG.bt PKG_FLAGS_FINALIZED / LibOrbisPkg PKG_FLAG_FINALIZED.)
 _FLAG_FINALIZED = 0x80000000
-# FIH signed byte (offset 0x05): 0x80 retail, 0x00 debug.
+# FIH signed byte (offset 0x05): 0x80 = retail (Sony-finalized), 0x00 = not
+# finalized (Debug or fpkg -- see detect_edition).
 _FIH_SIGNED_RETAIL = 0x80
 
 # param.sfo value formats (SFO/ParamSfo.cs SfoEntryType).
@@ -588,7 +592,11 @@ def _parse(source: ByteSource) -> Pkg:
         entry_table_offset=entry_table_offset,
         pfs_image_offset=pfs_image_offset,
         cnt_base=cnt_base,
-        edition=detect_edition(fih_signed, header_flags),
+        edition=detect_edition(
+            fih_signed,
+            header_flags,
+            has_license=(ENTRY_LICENSE_DAT in entries or ENTRY_LICENSE_INFO in entries),
+        ),
         digests_base=digests_base,
         package_size=package_size,
         entries=entries,
@@ -766,18 +774,30 @@ def classify_kind_ps5(content_flags: int, content_type: int) -> str:
     return "Game"
 
 
-def detect_edition(fih_signed: Optional[int], header_flags: int) -> str:
+def detect_edition(
+    fih_signed: Optional[int],
+    header_flags: int,
+    has_license: bool = False,
+) -> str:
     """Classify a package as Retail / Debug / fpkg.
 
-    - PS5 finalized images carry a signed byte (FIH offset 0x05): 0x80 = retail,
-      0x00 = debug. This is definitive when present.
+    - PS5 finalized images carry a signed byte (FIH offset 0x05): 0x80 = retail
+      (Sony-finalized/submitted). This is definitive.
+    - A non-retail FIH (0x05 == 0x00) is split on whether it carries the NpDrm
+      ``license.dat`` (entry 0x400) / ``license.info`` (entry 0x401) entries:
+        * license entries present -> fpkg
+        * license entries absent   -> Debug
+      ``has_license`` is true when either entry is present.
     - Otherwise (PS4 packages, bare PS5 CNTs) we use the FINALIZED flag (header
-      offset 0x04, bit 31). Retail/official packages are finalized; fake/homebrew
-      packages (fpkg) are not.
+      offset 0x04, bit 31): set -> Retail, unset -> fpkg.
     """
     if fih_signed is not None:
-        return "Retail" if fih_signed == _FIH_SIGNED_RETAIL else "Debug"
-    return "Retail" if (header_flags & _FLAG_FINALIZED) else "fpkg"
+        if fih_signed == _FIH_SIGNED_RETAIL:
+            return "Retail"
+        return "fpkg" if has_license else "Debug"
+    if header_flags & _FLAG_FINALIZED:
+        return "Retail"
+    return "fpkg"
 
 
 def region_from_content_id(content_id: str) -> str:
