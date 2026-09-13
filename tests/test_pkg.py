@@ -214,32 +214,61 @@ def build_cnt(entries_data, content_id, content_type=0x20, content_flags=0, pack
     return bytes(buf)
 
 
+_SBLOCK_SIZE = 0x10000
+_SBLOCK_MAGIC = 20130315
+_SBLOCK_SEED_OFFSET = 0x370
+_PLAINTEXT_NOAUTH_MARKER = b"PPRPLAIN-NOAUTH!"
+
+
+def _build_sblock(plaintext_noauth=False):
+    """Build a minimal outer-PFS superblock block (0x10000 bytes).
+
+    Carries the superblock magic (0x08) the marker check validates, and either a
+    fixed PLAINTEXT_NOAUTH seed marker (0x370) or a random-looking seed.
+    """
+    sb = bytearray(_SBLOCK_SIZE)
+    struct.pack_into("<q", sb, 0x08, _SBLOCK_MAGIC)
+    struct.pack_into("<H", sb, 0x1C, 0x000D)  # kernel superblock mode (both profiles)
+    if plaintext_noauth:
+        sb[_SBLOCK_SEED_OFFSET : _SBLOCK_SEED_OFFSET + len(_PLAINTEXT_NOAUTH_MARKER)] = _PLAINTEXT_NOAUTH_MARKER
+    else:
+        # A non-marker seed (stock/Native profile).
+        sb[_SBLOCK_SEED_OFFSET : _SBLOCK_SEED_OFFSET + 16] = bytes(range(1, 17))
+    return bytes(sb)
+
+
 def build_ps5_pkg(param_obj, icon0=b"", content_id="UP4433-PPSA19639_00-CPREVIEW00000000",
-                  content_flags=0, signed=0x80, content_type=0x20, license=False):
+                  content_flags=0, signed=0x80, content_type=0x20, plaintext_noauth=False):
     """Build a PS5 \\x7FFIH image wrapping a CNT with param.json (0x2000).
 
-    signed: FIH signed byte (0x80 = retail, 0x00 = debug).
+    Layout mirrors a real finalized image: FIH header region (0x10000), then the
+    outer-PFS superblock block (0x10000, whose absolute offset is recorded in the
+    FIH header at 0x20), then the embedded CNT.
+
+    signed: FIH signed byte (0x80 = retail, 0x00 = not finalized).
     content_type: 0x20 full app, 0x23 delta patch.
-    license: when True, add the NpDrm license.dat (0x400) / license.info (0x401)
-        entries (present on retail and fpkg, absent on Debug builds).
+    plaintext_noauth: when True, stamp the PLAINTEXT_NOAUTH seed marker into the
+        outer superblock (the fpkg signal); otherwise leave a stock seed.
     """
     import json
 
     entries = [(0x2000, json.dumps(param_obj).encode("utf-8"))]
     if icon0:
         entries.append((0x1200, icon0))
-    if license:
-        entries.append((0x400, b"license.dat"))
-        entries.append((0x401, b"license.info"))
     cnt = build_cnt(entries, content_id, content_type=content_type, content_flags=content_flags)
 
-    cnt_base = 0x10000  # FIH header region, then the embedded CNT
-    fih = bytearray(b"\x00" * cnt_base)
+    fih_region = 0x10000            # FIH header region
+    sblock_offset = fih_region      # superblock sits right after the FIH header
+    cnt_base = fih_region + _SBLOCK_SIZE  # embedded CNT follows the superblock
+
+    fih = bytearray(b"\x00" * fih_region)
     fih[0:4] = b"\x7fFIH"
     fih[0x05] = signed
     struct.pack_into("<H", fih, 0x06, 3)  # FIH format version (LE); mount requires 3
-    struct.pack_into("<Q", fih, 0x58, cnt_base)  # embedded CNT offset
-    return bytes(fih) + cnt
+    struct.pack_into("<Q", fih, 0x20, sblock_offset)   # plaintext superblock offset
+    struct.pack_into("<Q", fih, 0x28, _SBLOCK_SIZE)    # superblock size
+    struct.pack_into("<Q", fih, 0x58, cnt_base)        # embedded CNT offset
+    return bytes(fih) + _build_sblock(plaintext_noauth) + cnt
 
 
 def test_ps5_pkg_parse():
@@ -364,15 +393,15 @@ def test_marriage_digest_excluded_cases():
 def test_edition_detection():
     from pkgtool.pkg import detect_edition
 
-    # PS5 finalized image: signed byte 0x80 is definitively retail (license
-    # entries, always present on retail, don't change that).
+    # PS5 finalized image: signed byte 0x80 is definitively retail (the outer-PFS
+    # profile doesn't change that).
     assert detect_edition(0x80, 0) == "Retail"
-    assert detect_edition(0x80, 0, has_license=True) == "Retail"
-    # Non-retail FIH (0x00): split on the NpDrm license entries -- present -> fpkg,
-    # absent -> Debug.
+    assert detect_edition(0x80, 0, True) == "Retail"
+    # Non-retail FIH (0x00): split on the PLAINTEXT_NOAUTH seed marker --
+    # present -> fpkg, absent -> Debug.
     assert detect_edition(0x00, 0) == "Debug"
-    assert detect_edition(0x00, 0, has_license=False) == "Debug"
-    assert detect_edition(0x00, 0, has_license=True) == "fpkg"
+    assert detect_edition(0x00, 0, False) == "Debug"
+    assert detect_edition(0x00, 0, True) == "fpkg"
     # Bare CNT / PS4: FINALIZED flag (bit 31) at header 0x04.
     assert detect_edition(None, 0x83020001) == "Retail"
     assert detect_edition(None, 0x00000001) == "fpkg"
@@ -380,7 +409,8 @@ def test_edition_detection():
 
 
 def test_ps5_debug_edition():
-    # A non-retail FIH (signed byte 0x00) with no NpDrm license entries -> Debug.
+    # A non-retail FIH (signed byte 0x00) whose outer superblock has a stock seed
+    # (no PLAINTEXT_NOAUTH marker) -> Debug.
     param = {"titleId": "PPSA00001", "localizedParameters": {"defaultLanguage": "en", "en": {"titleName": "Dbg"}}}
     img = build_ps5_pkg(param, signed=0x00)
     with Pkg.from_source(BytesSource(img)) as pkg:
@@ -388,19 +418,19 @@ def test_ps5_debug_edition():
 
 
 def test_ps5_fpkg_edition():
-    # A non-retail FIH (signed byte 0x00) carrying the NpDrm license.dat /
-    # license.info entries -> fpkg.
+    # A non-retail FIH (signed byte 0x00) whose outer superblock carries the
+    # PLAINTEXT_NOAUTH seed marker -> fpkg.
     param = {"titleId": "PPSA00001", "localizedParameters": {"defaultLanguage": "en", "en": {"titleName": "Fake"}}}
-    img = build_ps5_pkg(param, signed=0x00, license=True)
+    img = build_ps5_pkg(param, signed=0x00, plaintext_noauth=True)
     with Pkg.from_source(BytesSource(img)) as pkg:
         assert pkg.edition == "fpkg"
 
 
-def test_ps5_retail_edition_with_license():
-    # Retail packages carry license entries too, but the 0x80 signed byte makes
-    # them Retail regardless.
+def test_ps5_retail_edition_ignores_marker():
+    # The 0x80 signed byte makes a package Retail even if the outer superblock
+    # happens to carry the PLAINTEXT_NOAUTH marker (retail is never re-checked).
     param = {"titleId": "PPSA00001", "localizedParameters": {"defaultLanguage": "en", "en": {"titleName": "Retail"}}}
-    img = build_ps5_pkg(param, signed=0x80, license=True)
+    img = build_ps5_pkg(param, signed=0x80, plaintext_noauth=True)
     with Pkg.from_source(BytesSource(img)) as pkg:
         assert pkg.edition == "Retail"
 

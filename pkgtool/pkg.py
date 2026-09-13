@@ -52,16 +52,27 @@ _OFF_PACKAGE_SIZE = 0x430  # declared total package size (u64 BE)
 # FIH header field offsets (little-endian). See LibProsperoPkg ProsperoPkgLayout.
 _FIH_SIGNED_BYTE = 0x05
 _FIH_FORMAT_VERSION = 0x06   # u16 LE; console mount path requires 3 for FIH
+_FIH_SBLOCK_OFFSET = 0x20    # u64 LE: absolute offset of the plaintext outer superblock
+_FIH_SBLOCK_SIZE = 0x28      # u64 LE: size of that superblock block (0x10000)
 _FIH_EMBEDDED_CNT_OFFSET = 0x58
 _LIH_EMBEDDED_CNT_OFFSET = 0x30
 
+# Outer-PFS superblock fields. The superblock carries a magic at 0x08 and a Seed
+# at 0x370. In the stock (Native) build profile the seed is random; the
+# PLAINTEXT_NOAUTH profile writes a fixed marker there instead (LibProsperoPkg
+# ProsperoOuterPfsBuilder.PlaintextNoAuthSeedMarker). Both profiles use the same
+# superblock mode 0x0D, so the seed marker is the only field that distinguishes
+# them.
+_SBLOCK_MAGIC_OFFSET = 0x08
+_SBLOCK_MAGIC = 20130315
+_SBLOCK_SEED_OFFSET = 0x370
+_PLAINTEXT_NOAUTH_MARKER = b"PPRPLAIN-NOAUTH!"  # 16-byte PLAINTEXT_NOAUTH seed marker
+
 # Finalized/intermediate image format versions (LibProsperoPkg ProsperoPkgLayout
 # FihRequiredFormatVersion / ProsperoNpDrmContentInfo.ResolveContainerOffset).
-# The version u16 sits at offset 0x06 and is read in the byte order of the header
-# carrying it: little-endian for the LE FIH/LIH images (a v3 image stores the
-# bytes 03 00), big-endian for the BE \x7FCNT container. Confirmed against a real
-# debug image (bytes 03 00 -> 3); the reference now reads FIH/LIH LE and CNT BE
-# (ProsperoNpDrmContentInfo.ResolveContainerOffset), matching this parser.
+# The version u16 at offset 0x06 is read in the byte order of the header carrying
+# it: little-endian for the LE FIH/LIH images (a v3 image stores the bytes 03 00),
+# big-endian for the BE \x7FCNT container.
 _FIH_REQUIRED_VERSION = 3
 _LIH_REQUIRED_VERSION = 1
 
@@ -76,8 +87,6 @@ ENTRY_IMAGE_KEY = 0x00000020
 ENTRY_GENERAL_DIGESTS = 0x00000080
 ENTRY_METAS = 0x00000100
 ENTRY_ENTRY_NAMES = 0x00000200
-ENTRY_LICENSE_DAT = 0x00000400     # NpDrm license.dat  (present in retail + fpkg)
-ENTRY_LICENSE_INFO = 0x00000401    # NpDrm license.info (present in retail + fpkg)
 ENTRY_IMAGEDIGS = 0x0000040A    # imagedigs.dat (present in every finalized PS5 image)
 ENTRY_PARAM_SFO = 0x00001000    # PS4 param.sfo
 ENTRY_PIC1_PNG = 0x00001006
@@ -532,8 +541,41 @@ def _locate_cnt(source: ByteSource):
     raise PkgError("not a PS4/PS5 PKG (bad magic)")
 
 
+def _has_plaintext_noauth_marker(source: ByteSource, fih_head: bytes) -> bool:
+    """True if the outer PFS superblock carries the PLAINTEXT_NOAUTH seed marker.
+
+    ``fih_head`` is the first 0x60 bytes of a \\x7FFIH header, which records the
+    outer superblock's absolute offset (0x20) and size (0x28). The PLAINTEXT_NOAUTH
+    profile stamps ``PPRPLAIN-NOAUTH!`` into the superblock Seed field (0x370); the
+    stock profile leaves a random seed there.
+
+    The superblock magic is validated before the seed is read, so an absent or
+    garbage block cannot yield a false positive. A read failure (e.g. a
+    metadata-only fragment without the outer body) returns False.
+    """
+    sblock_offset = _u64le(fih_head, _FIH_SBLOCK_OFFSET)
+    sblock_size = _u64le(fih_head, _FIH_SBLOCK_SIZE)
+    if sblock_offset == 0 or sblock_size < _SBLOCK_SEED_OFFSET + len(_PLAINTEXT_NOAUTH_MARKER):
+        return False
+    try:
+        sblock = source.read(sblock_offset, sblock_size)
+    except PkgError:
+        return False
+    if _u64le(sblock, _SBLOCK_MAGIC_OFFSET) != _SBLOCK_MAGIC:
+        return False
+    seed = sblock[_SBLOCK_SEED_OFFSET : _SBLOCK_SEED_OFFSET + len(_PLAINTEXT_NOAUTH_MARKER)]
+    return seed == _PLAINTEXT_NOAUTH_MARKER
+
+
 def _parse(source: ByteSource) -> Pkg:
     cnt_base, fih_signed = _locate_cnt(source)
+
+    # A non-retail FIH image (signed byte 0x00) is an fpkg when its outer PFS
+    # superblock carries the PLAINTEXT_NOAUTH seed marker, otherwise a stock debug
+    # image. Retail (0x80) and the PS4/bare-CNT path don't use the marker.
+    is_plaintext_noauth = False
+    if fih_signed is not None and fih_signed != _FIH_SIGNED_RETAIL:
+        is_plaintext_noauth = _has_plaintext_noauth_marker(source, source.read(0, 0x60))
 
     # CNT header (big-endian), 0x5A0 bytes; read a bit extra to cover 0x410.
     header = source.read(cnt_base, 0x600)
@@ -592,11 +634,7 @@ def _parse(source: ByteSource) -> Pkg:
         entry_table_offset=entry_table_offset,
         pfs_image_offset=pfs_image_offset,
         cnt_base=cnt_base,
-        edition=detect_edition(
-            fih_signed,
-            header_flags,
-            has_license=(ENTRY_LICENSE_DAT in entries or ENTRY_LICENSE_INFO in entries),
-        ),
+        edition=detect_edition(fih_signed, header_flags, is_plaintext_noauth),
         digests_base=digests_base,
         package_size=package_size,
         entries=entries,
@@ -777,24 +815,24 @@ def classify_kind_ps5(content_flags: int, content_type: int) -> str:
 def detect_edition(
     fih_signed: Optional[int],
     header_flags: int,
-    has_license: bool = False,
+    is_plaintext_noauth: bool = False,
 ) -> str:
     """Classify a package as Retail / Debug / fpkg.
 
     - PS5 finalized images carry a signed byte (FIH offset 0x05): 0x80 = retail
       (Sony-finalized/submitted). This is definitive.
-    - A non-retail FIH (0x05 == 0x00) is split on whether it carries the NpDrm
-      ``license.dat`` (entry 0x400) / ``license.info`` (entry 0x401) entries:
-        * license entries present -> fpkg
-        * license entries absent   -> Debug
-      ``has_license`` is true when either entry is present.
-    - Otherwise (PS4 packages, bare PS5 CNTs) we use the FINALIZED flag (header
-      offset 0x04, bit 31): set -> Retail, unset -> fpkg.
+    - A non-retail FIH (0x05 == 0x00) is split by the PLAINTEXT_NOAUTH seed
+      marker in its outer superblock (``is_plaintext_noauth``, see
+      ``_has_plaintext_noauth_marker``): present -> fpkg, absent -> Debug. The
+      superblock mode flag is 0x0D for both build profiles, so the seed marker is
+      the only field that separates them.
+    - Otherwise (PS4 packages, bare PS5 CNTs) the FINALIZED flag (header offset
+      0x04, bit 31) decides: set -> Retail, unset -> fpkg.
     """
     if fih_signed is not None:
         if fih_signed == _FIH_SIGNED_RETAIL:
             return "Retail"
-        return "fpkg" if has_license else "Debug"
+        return "fpkg" if is_plaintext_noauth else "Debug"
     if header_flags & _FLAG_FINALIZED:
         return "Retail"
     return "fpkg"
