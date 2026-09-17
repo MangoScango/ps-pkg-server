@@ -555,7 +555,8 @@ def test_split_scan_and_download():
             assert r2.headers["content-length"] == str(hi - lo + 1)
 
 
-def test_hide_delta_and_sc():
+def test_hide_delta_and_error_on_orphan_fragment():
+    """A delta patch is hidden; an orphaned tail-less CNT is a visible error."""
     import json
     from pkgtool.scan import scan
     from tests.test_pkg import build_cnt, build_ps5_pkg, build_pkg
@@ -571,8 +572,10 @@ def test_hide_delta_and_sc():
         with open(os.path.join(root, "DELTA-DP.pkg"), "wb") as f:
             f.write(build_ps5_pkg(param, content_flags=0x43400000, content_type=0x23))
 
-        # An orphaned SC fragment: bare CNT declaring a huge package_size but a
-        # tiny file -> hidden. (Named so it isn't grouped as a split part.)
+        # An orphaned tail-less CNT: declares a huge package_size but is a tiny
+        # file, with no main to complete it. This is broken/incomplete and must
+        # surface as an ERROR (not silently hidden). (Named so it isn't grouped as
+        # a split part.)
         pj = json.dumps({"titleId": "PPSA00003",
                          "localizedParameters": {"defaultLanguage": "en", "en": {"titleName": "Frag"}}}).encode()
         cnt = build_cnt([(0x2000, pj)], "IP9100-PPSA00003_00-XXXX",
@@ -585,9 +588,14 @@ def test_hide_delta_and_sc():
         hidden = {r.hidden_reason for r in res.hidden}
         assert shown == {"CUSA00001"}, shown
         assert len(res.records) == 1
-        assert "delta patch" in hidden
-        assert "metadata fragment (sc)" in hidden
-        assert len(res.hidden) == 2
+        # The delta patch is hidden.
+        assert hidden == {"delta patch"}
+        assert len(res.hidden) == 1
+        # The orphaned tail-less fragment is a visible error, not hidden.
+        assert len(res.errors) == 1
+        err = res.errors[0]
+        assert err.filename == "FRAGMENT-META.pkg"
+        assert "incomplete package" in (err.error or "")
 
 
 def test_grouping_representative():
@@ -737,6 +745,226 @@ def test_group_split_by_build():
     assert len(gs) == 3
     shared = next(g for g in gs if g.build == "")
     assert [m.kind for m in shared.members] == ["DLC"]
+
+
+def _write_headless_main(root, name, *, pfs_image_size):
+    """Write a headless \\x7FFIH main image (its embedded CNT split out).
+
+    Built from a full PS5 image with its FIH outer-PFS image size (0x18) patched
+    to ``pfs_image_size`` and cut at the embedded-CNT boundary, so the file's CNT
+    offset (0x58) equals its own size -> headless.
+    """
+    import struct
+    from tests.test_pkg import build_ps5_pkg
+
+    param = {"titleId": "PPSA00000",
+             "localizedParameters": {"defaultLanguage": "en", "en": {"titleName": "main"}}}
+    img = bytearray(build_ps5_pkg(param, content_type=0x20))
+    cnt_base = struct.unpack_from("<Q", img, 0x58)[0]
+    struct.pack_into("<Q", img, 0x18, pfs_image_size)
+    with open(os.path.join(root, name), "wb") as f:
+        f.write(bytes(img[:cnt_base]))
+
+
+def _write_sc(root, name, *, content_id, title, pfs_image_size):
+    """Write a bare \\x7FCNT SC tail with a given content id and PFS image size.
+
+    The SC's CNT PFS image size (0x418) is the structural key that matches it to a
+    headless main written with the same size.
+    """
+    import struct
+    from tests.test_pkg import build_ps5_pkg
+
+    param = {"titleId": "PPSA00000",
+             "localizedParameters": {"defaultLanguage": "en", "en": {"titleName": title}}}
+    img = bytearray(build_ps5_pkg(param, content_id=content_id, content_type=0x20))
+    cnt_base = struct.unpack_from("<Q", img, 0x58)[0]
+    struct.pack_into(">Q", img, cnt_base + 0x410 + 0x08, pfs_image_size)
+    with open(os.path.join(root, name), "wb") as f:
+        f.write(bytes(img[cnt_base:]))  # bare CNT tail
+
+
+def test_group_sources_divergent_name_sc_pairing():
+    """CDN packages whose main and _sc filenames diverge are paired structurally
+    (equal PFS image size, then content-label tiebreak), not by filename stem.
+
+    Two DLC share one PFS image size (0x90000) with distinct mains -> each is a
+    1:1 pairing resolved by content label; a third app has a unique size."""
+    from pkgtool.scan import group_sources, find_pkgs
+
+    with tempfile.TemporaryDirectory() as root:
+        for label in ("AC00000000000008", "AR00000000000004"):
+            _write_headless_main(root, f"JP0082-PPSA08664_00-{label}.pkg", pfs_image_size=0x90000)
+            _write_sc(root, f"EP0082-PPSA08668_00-{label}_sc.pkg",
+                      content_id=f"EP0082-PPSA08668_00-{label}", title="DLC", pfs_image_size=0x90000)
+        _write_headless_main(root, "JP0082-PPSA08664_00-YOUTUBESIEA00000.pkg", pfs_image_size=0x4e00000)
+        _write_sc(root, "EP4381-PPSA01651_00-YOUTUBESIEE00000_sc.pkg",
+                  content_id="EP4381-PPSA01651_00-YOUTUBESIEE00000", title="YouTube", pfs_image_size=0x4e00000)
+
+        sources = group_sources(find_pkgs([root]))
+        # One combined package per SC (SC-driven identity), keyed on the SC file.
+        assert len(sources) == 3
+        by_sc = {os.path.basename(s["parts"][1]): s for s in sources if len(s["parts"]) == 2}
+        expected = {
+            "EP0082-PPSA08668_00-AC00000000000008_sc.pkg": "JP0082-PPSA08664_00-AC00000000000008.pkg",
+            "EP0082-PPSA08668_00-AR00000000000004_sc.pkg": "JP0082-PPSA08664_00-AR00000000000004.pkg",
+            "EP4381-PPSA01651_00-YOUTUBESIEE00000_sc.pkg": "JP0082-PPSA08664_00-YOUTUBESIEA00000.pkg",
+        }
+        assert set(by_sc) == set(expected)
+        for sc_name, main_name in expected.items():
+            s = by_sc[sc_name]
+            assert s["split"] is True
+            assert os.path.basename(s["parts"][0]) == main_name, sc_name
+            # Package identity comes from the SC (its content id), not the main.
+            assert s["name"] == sc_name.replace("_sc.pkg", ".pkg")
+
+
+def test_group_sources_shared_main_fans_out_to_region_scs():
+    """One shared main body + several region SCs -> one package per SC, all
+    reusing the single main. The SC alone distinguishes the region editions."""
+    from pkgtool.scan import group_sources, find_pkgs
+
+    with tempfile.TemporaryDirectory() as root:
+        # A single YouTube main body...
+        _write_headless_main(root, "UP4381-PPSA01650_00-YOUTUBESIEA00000.pkg", pfs_image_size=0x4e00000)
+        # ...backing three region SCs (US same-stem, EU, JP), all same PFS size.
+        region_scs = {
+            "UP4381-PPSA01650_00-YOUTUBESIEA00000_sc.pkg": "UP4381-PPSA01650_00-YOUTUBESIEA00000",
+            "EP4381-PPSA01651_00-YOUTUBESIEE00000_sc.pkg": "EP4381-PPSA01651_00-YOUTUBESIEE00000",
+            "JA0004-PPSA01652_00-YOUTUBESIEJA0000_sc.pkg": "JA0004-PPSA01652_00-YOUTUBESIEJA0000",
+        }
+        for sc_name, cid in region_scs.items():
+            _write_sc(root, sc_name, content_id=cid, title="YouTube", pfs_image_size=0x4e00000)
+
+        sources = group_sources(find_pkgs([root]))
+        # Three packages, one per SC, each reusing the single shared main.
+        assert len(sources) == 3
+        main_name = "UP4381-PPSA01650_00-YOUTUBESIEA00000.pkg"
+        seen_scs = set()
+        for s in sources:
+            assert s["split"] is True
+            assert len(s["parts"]) == 2
+            assert os.path.basename(s["parts"][0]) == main_name  # shared main
+            seen_scs.add(os.path.basename(s["parts"][1]))
+        assert seen_scs == set(region_scs)
+
+
+def test_group_sources_two_bodies_matched_by_content_id_similarity():
+    """Two distinct same-size main bodies + two SCs must each pair to the RIGHT
+    body via content-id similarity (publisher code + label), not greedily collapse
+    onto one main and orphan the other."""
+    from pkgtool.scan import group_sources, find_pkgs
+
+    with tempfile.TemporaryDirectory() as root:
+        # Two regional bodies of one title: publisher 4381, regions UP / EP.
+        _write_headless_main(root, "UP4381-PPSA01650_00-YOUTUBESIEA00000.pkg", pfs_image_size=0x300000)
+        _write_headless_main(root, "EP4381-PPSA01651_00-YOUTUBESIEE00000.pkg", pfs_image_size=0x300000)
+        _write_sc(root, "UP4381-PPSA01650_00-YOUTUBESIEA00000_sc.pkg",
+                  content_id="UP4381-PPSA01650_00-YOUTUBESIEA00000", title="US", pfs_image_size=0x300000)
+        _write_sc(root, "EP4381-PPSA01651_00-YOUTUBESIEE00000_sc.pkg",
+                  content_id="EP4381-PPSA01651_00-YOUTUBESIEE00000", title="EU", pfs_image_size=0x300000)
+
+        sources = group_sources(find_pkgs([root]))
+        # Two two-part packages; each SC paired to its own matching body.
+        pairs = {os.path.basename(s["parts"][1]): os.path.basename(s["parts"][0])
+                 for s in sources if len(s["parts"]) == 2}
+        assert pairs == {
+            "UP4381-PPSA01650_00-YOUTUBESIEA00000_sc.pkg": "UP4381-PPSA01650_00-YOUTUBESIEA00000.pkg",
+            "EP4381-PPSA01651_00-YOUTUBESIEE00000_sc.pkg": "EP4381-PPSA01651_00-YOUTUBESIEE00000.pkg",
+        }
+        # No main left orphaned as a standalone.
+        assert all(len(s["parts"]) == 2 for s in sources)
+
+
+def test_content_id_affinity_weights_publisher_code():
+    from pkgtool.scan import _content_id_affinity
+
+    us = "UP4381-PPSA01650_00-YOUTUBESIEA00000"
+    eu = "EP4381-PPSA01651_00-YOUTUBESIEE00000"
+    unrelated = "JP0506-PPSA03169_00-2465683171993968"
+    # Exact id beats a cross-region (publisher-only) match, which beats unrelated.
+    assert _content_id_affinity(us, us) > _content_id_affinity(us, eu)
+    assert _content_id_affinity(us, eu) > _content_id_affinity(us, unrelated)
+    # A shared publisher code alone (regions differ) is a strong positive signal.
+    assert _content_id_affinity(us, eu) >= 1_000_000
+    # No publisher match and no label match -> no bonus.
+    assert _content_id_affinity(us, unrelated) < 1_000_000
+
+
+def test_group_sources_orphan_sc_and_main_left_alone():
+    """An SC with no same-size main, and a main with no SC, are not paired; they
+    fall back to standalone single-file sources."""
+    from pkgtool.scan import group_sources, find_pkgs
+
+    with tempfile.TemporaryDirectory() as root:
+        _write_headless_main(root, "UP0000-PPSA00001_00-LONELYMAIN0000000.pkg", pfs_image_size=0x50000)
+        _write_sc(root, "EP0000-PPSA00002_00-LONELYSC000000000_sc.pkg",
+                  content_id="EP0000-PPSA00002_00-LONELYSC000000000", title="Orphan", pfs_image_size=0x999000)
+
+        sources = group_sources(find_pkgs([root]))
+        # No size match -> no pairing; both remain single-file sources.
+        assert all(len(s["parts"]) == 1 for s in sources)
+        names = {os.path.basename(s["parts"][0]) for s in sources}
+        assert names == {
+            "UP0000-PPSA00001_00-LONELYMAIN0000000.pkg",
+            "EP0000-PPSA00002_00-LONELYSC000000000_sc.pkg",
+        }
+
+
+def test_group_sources_standalone_cnt_not_paired_as_sc():
+    """A bare-CNT package NOT named ``_sc.pkg`` (e.g. a -MERGED standalone) is
+    never treated as an SC tail, even when a same-size headless main is present.
+    It stays a standalone single-file source, and the real ``_sc.pkg`` pairs with
+    the main."""
+    from pkgtool.scan import group_sources, find_pkgs
+
+    with tempfile.TemporaryDirectory() as root:
+        _write_headless_main(root, "UP4381-PPSA01650_00-YOUTUBESIEA00000.pkg", pfs_image_size=0x4e00000)
+        # Its true SC tail (same stem, _sc.pkg) -> pairs with the main.
+        _write_sc(root, "UP4381-PPSA01650_00-YOUTUBESIEA00000_sc.pkg",
+                  content_id="UP4381-PPSA01650_00-YOUTUBESIEA00000", title="YouTube",
+                  pfs_image_size=0x4e00000)
+        # A -MERGED standalone (same content, same PFS size, but NOT _sc.pkg).
+        _write_sc(root, "UP4381-PPSA01650_00-YOUTUBESIEA00000-MERGED.pkg",
+                  content_id="UP4381-PPSA01650_00-YOUTUBESIEA00000", title="YouTube",
+                  pfs_image_size=0x4e00000)
+
+        sources = group_sources(find_pkgs([root]))
+        pkg_by_name = {s["name"]: s for s in sources}
+        # The main + its _sc pair into one two-part package.
+        pair = next(s for s in sources if len(s["parts"]) == 2)
+        assert os.path.basename(pair["parts"][0]) == "UP4381-PPSA01650_00-YOUTUBESIEA00000.pkg"
+        assert os.path.basename(pair["parts"][1]) == "UP4381-PPSA01650_00-YOUTUBESIEA00000_sc.pkg"
+        # The -MERGED file stands alone, paired with nothing.
+        merged = pkg_by_name["UP4381-PPSA01650_00-YOUTUBESIEA00000-MERGED.pkg"]
+        assert merged["parts"] == [
+            os.path.join(root, "UP4381-PPSA01650_00-YOUTUBESIEA00000-MERGED.pkg")
+        ]
+        assert merged["split"] is False
+
+
+def test_group_sources_sc_not_paired_across_directories():
+    """A main and an SC in different directories are never paired -- a split
+    package is always delivered with its SC alongside the main."""
+    from pkgtool.scan import group_sources, find_pkgs
+
+    with tempfile.TemporaryDirectory() as root:
+        lib_a = os.path.join(root, "libA")
+        lib_b = os.path.join(root, "libB")
+        os.makedirs(lib_a)
+        os.makedirs(lib_b)
+        _write_headless_main(lib_a, "UP0000-PPSA00001_00-APP0000000000000.pkg", pfs_image_size=0x300000)
+        # Same PFS size, but the SC lives in a different directory -> no pairing.
+        _write_sc(lib_b, "EP0000-PPSA00002_00-APP0000000000000_sc.pkg",
+                  content_id="EP0000-PPSA00002_00-APP0000000000000", title="App",
+                  pfs_image_size=0x300000)
+
+        sources = group_sources(find_pkgs([root]))
+        assert all(len(s["parts"]) == 1 for s in sources)
+        assert {os.path.basename(s["parts"][0]) for s in sources} == {
+            "UP0000-PPSA00001_00-APP0000000000000.pkg",
+            "EP0000-PPSA00002_00-APP0000000000000_sc.pkg",
+        }
 
 
 if __name__ == "__main__":

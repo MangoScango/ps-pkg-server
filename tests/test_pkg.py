@@ -523,6 +523,40 @@ def test_fih_bad_version_rejected():
         raise AssertionError("expected PkgError for unsupported FIH version")
 
 
+def test_probe_split_header_classification():
+    from pkgtool.pkg import probe_split_header, BytesSource
+
+    param = {"titleId": "PPSA00001",
+             "localizedParameters": {"defaultLanguage": "en", "en": {"titleName": "X"}}}
+    full = bytes(build_ps5_pkg(param, content_id="UP0000-PPSA00001_00-LABEL00000000000"))
+    cnt_base = struct.unpack_from("<Q", bytearray(full), 0x58)[0]
+
+    # A FIH whose embedded-CNT offset lands past EOF (its CNT split out) -> headless.
+    main = full[:cnt_base]
+    hm = probe_split_header(BytesSource(main), len(main))
+    assert hm.kind == "headless_main"
+
+    # A tail-less CNT: declared PFS image extends past the bytes present -> sc.
+    sc = bytearray(full[cnt_base:])
+    struct.pack_into(">Q", sc, 0x410, 0x10000)      # pfs image offset
+    struct.pack_into(">Q", sc, 0x418, 0x4e00000)    # pfs image size (far past EOF)
+    sch = probe_split_header(BytesSource(bytes(sc)), len(sc))
+    assert sch.kind == "sc"
+    assert sch.content_label == "LABEL00000000000"
+
+    # A complete CNT whose whole PFS image fits within the file (e.g. a merged
+    # pkg) -> standalone, NOT sc; it must never be paired with a main.
+    complete = bytearray(full[cnt_base:])
+    struct.pack_into(">Q", complete, 0x410, 0x100)              # pfs image offset
+    struct.pack_into(">Q", complete, 0x418, len(complete) - 0x100)  # image ends at EOF
+    ch = probe_split_header(BytesSource(bytes(complete)), len(complete))
+    assert ch.kind == "standalone"
+
+    # A full FIH with its CNT inside the file -> standalone.
+    fh = probe_split_header(BytesSource(full), len(full))
+    assert fh.kind == "standalone"
+
+
 def test_ps5_title_fallback_any_language():
     # No default-language entry: fall back to any language's titleName.
     param = {

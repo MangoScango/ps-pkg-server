@@ -52,6 +52,8 @@ _OFF_PACKAGE_SIZE = 0x430  # declared total package size (u64 BE)
 # FIH header field offsets (little-endian). See LibProsperoPkg ProsperoPkgLayout.
 _FIH_SIGNED_BYTE = 0x05
 _FIH_FORMAT_VERSION = 0x06   # u16 LE; console mount path requires 3 for FIH
+_FIH_PFS_IMAGE_OFFSET = 0x10  # u64 LE: offset of the outer PFS image (0x10000)
+_FIH_PFS_IMAGE_SIZE = 0x18    # u64 LE: size of the outer PFS image
 _FIH_SBLOCK_OFFSET = 0x20    # u64 LE: absolute offset of the plaintext outer superblock
 _FIH_SBLOCK_SIZE = 0x28      # u64 LE: size of that superblock block (0x10000)
 _FIH_EMBEDDED_CNT_OFFSET = 0x58
@@ -567,6 +569,76 @@ def _has_plaintext_noauth_marker(source: ByteSource, fih_head: bytes) -> bool:
     return seed == _PLAINTEXT_NOAUTH_MARKER
 
 
+@dataclass
+class SplitHeader:
+    """Front-of-file facts needed to pair a headless main image with its SC tail.
+
+    Read cheaply from the first blocks of a file, without a full parse (a headless
+    main has no CNT to parse, and an SC tail is only a partial container). See
+    ``probe_split_header``.
+    """
+
+    kind: str            # "headless_main" | "sc" | "standalone"
+    pfs_image_size: int  # outer PFS image size (matches between a main and its SC)
+    content_id: str      # content id (SC only; "" for a headless main)
+
+    @property
+    def content_label(self) -> str:
+        return content_label_from_content_id(self.content_id)
+
+
+def probe_split_header(source: ByteSource, total_size: int) -> Optional[SplitHeader]:
+    """Classify a file for structural SC pairing, reading only its front.
+
+    Returns a :class:`SplitHeader`, or None if the file is neither a PS5 finalized
+    image nor a bare CNT (nothing to pair). The three kinds:
+
+    * ``headless_main``: a \\x7FFIH image whose embedded-CNT offset equals the file
+      size -- the CNT is not in this file but is expected to follow as an SC tail.
+    * ``sc``: a *tail-less* bare \\x7FCNT front -- its declared PFS image extends
+      past the bytes present, so the image lives in a separate main.
+    * ``standalone``: a \\x7FFIH image that already contains its own CNT, or a
+      complete \\x7FCNT that already contains its whole PFS image (e.g. a merged
+      pkg). It is not paired with anything.
+
+    A main and its SC are paired on ``pfs_image_size`` (a hard structural match),
+    then disambiguated by content-id similarity; see ``scan._pair_ps5_splits``.
+    """
+    try:
+        head = source.read(0, 0x60)
+    except PkgError:
+        return None
+    magic = head[0:4]
+
+    if magic == FIH_MAGIC:
+        cnt_off = _u64le(head, _FIH_EMBEDDED_CNT_OFFSET)
+        pfs_size = _u64le(head, _FIH_PFS_IMAGE_SIZE)
+        # cnt_off at/beyond EOF means the embedded CNT was split out as an SC tail.
+        kind = "headless_main" if cnt_off >= total_size else "standalone"
+        return SplitHeader(kind=kind, pfs_image_size=pfs_size, content_id="")
+
+    if magic == PKG_MAGIC:
+        # Bare CNT: read the header region for the content id and PFS image size.
+        try:
+            cnt = source.read(0, 0x600)
+        except PkgError:
+            return None
+        content_id = _cstr(cnt[_OFF_CONTENT_ID : _OFF_CONTENT_ID + _CONTENT_ID_SIZE])
+        pfs_image_offset = _u64be(cnt, _OFF_PFS_IMAGE_OFFSET)
+        pfs_size = _u64be(cnt, _OFF_PFS_IMAGE_OFFSET + 0x08)  # PFS image size (0x418, BE)
+        # Only a *tail-less* CNT is an SC front to be paired: its declared PFS
+        # image extends past the bytes actually present, i.e. the image lives in a
+        # separate main. A CNT that already contains its whole image is a complete,
+        # standalone package (e.g. a merged pkg) and must not be paired.
+        if pfs_image_offset + pfs_size > total_size:
+            kind = "sc"
+        else:
+            kind = "standalone"
+        return SplitHeader(kind=kind, pfs_image_size=pfs_size, content_id=content_id)
+
+    return None
+
+
 def _parse(source: ByteSource) -> Pkg:
     cnt_base, fih_signed = _locate_cnt(source)
 
@@ -694,6 +766,17 @@ def title_id_from_content_id(content_id: str) -> str:
     underscore = content_id.find("_", start)
     end = underscore if underscore >= 0 else len(content_id)
     return content_id[start:end]
+
+
+def content_label_from_content_id(content_id: str) -> str:
+    """Content label = the final ``-`` segment of a content id.
+
+    e.g. ``UP4433-PPSA19639_00-YOUTUBESIEA00000`` -> ``YOUTUBESIEA00000``.
+    """
+    if not content_id:
+        return ""
+    dash = content_id.rfind("-")
+    return content_id[dash + 1 :] if dash >= 0 else content_id
 
 
 def parse_sfo(data: bytes) -> Dict[str, object]:

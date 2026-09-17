@@ -15,7 +15,14 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, asdict
 from typing import Dict, List, Optional
 
-from .pkg import ConcatSource, Pkg, PkgError
+from .pkg import (
+    ConcatSource,
+    FileSource,
+    Pkg,
+    PkgError,
+    content_label_from_content_id,
+    probe_split_header,
+)
 
 
 @dataclass
@@ -295,15 +302,24 @@ def _classify_piece(path: str):
 def group_sources(paths: List[str]) -> List[dict]:
     """Group split parts into logical packages.
 
-    Split naming conventions handled:
+    PS5 CDN splits are grouped first, structurally: a headless \\x7FFIH main
+    image (its embedded CNT was split out) plus one or more bare \\x7FCNT SC tails.
+    A single shared main body can back several SC tails -- e.g. one YouTube image
+    with a US / EU / JP SC each -- so the SC drives package identity: every SC
+    becomes one combined package, completed by a same-PFS-size main. See
+    ``_pair_ps5_splits``.
+
+    The remaining files use filename-based grouping:
       - numbered 4 GiB chunks: ``<stem>_0.pkg, _1.pkg, ...`` (+ optional ``_sc.pkg``)
       - disc-backup pair:      ``<stem>.pkg`` + ``<stem>_sc.pkg``
     Everything else (including ``-DP`` delta patches and merged files) is a
     standalone single-file package. Returns dicts: {name, parts, split}.
     """
+    ps5_sources, remaining = _pair_ps5_splits(paths)
+
     groups: Dict[tuple, dict] = {}
     order: List[tuple] = []
-    for p in paths:
+    for p in remaining:
         key = (os.path.dirname(p), _classify_piece(p)[1])
         if key not in groups:
             groups[key] = {"num": {}, "sc": None, "base": []}
@@ -317,7 +333,7 @@ def group_sources(paths: List[str]) -> List[dict]:
         else:
             g["base"].append(p)
 
-    sources: List[dict] = []
+    sources: List[dict] = list(ps5_sources)
     for key in order:
         _dir, stem = key
         g = groups[key]
@@ -337,7 +353,128 @@ def group_sources(paths: List[str]) -> List[dict]:
             sources += [{"name": os.path.basename(b), "parts": [b], "split": False} for b in bases]
             if sc and not bases:
                 sources.append({"name": os.path.basename(sc), "parts": [sc], "split": False})
+
     return sources
+
+
+def _content_id_from_filename(path: str) -> str:
+    """Content id of a package from its filename stem (drop ``.pkg``/``_sc``).
+
+    A headless main has no readable content id, but its filename is the content id
+    (e.g. ``UP4381-PPSA01650_00-YOUTUBESIEA00000.pkg``), so the stem is used to
+    score similarity against an SC's content id.
+    """
+    stem = os.path.basename(path)
+    if stem.lower().endswith(".pkg"):
+        stem = stem[:-4]
+    if stem.lower().endswith("_sc"):
+        stem = stem[:-3]
+    return stem
+
+
+def _pair_ps5_splits(paths: List[str]):
+    """Pair headless-main images with their split-out CNT (SC) tails.
+
+    Returns ``(sources, remaining_paths)``. Emits one combined package per SC (a
+    shared main body can back several region SCs), matching each ``*_sc.pkg`` to
+    the same-directory, same-PFS-image-size main with the best ``_content_id_affinity``.
+    Unmatched mains/SCs are returned in ``remaining_paths``.
+    """
+    mains = []  # (path, dir, pfs_image_size, content_id)
+    scs = []    # (path, dir, pfs_image_size, content_id)
+    for p in paths:
+        kind, _stem, _idx = _classify_piece(p)
+        if kind == "num":
+            continue  # numbered chunk: leave to filename grouping
+        # Only *_sc.pkg files can be SC tails; anything else that is a bare CNT is
+        # a standalone package, not a split companion.
+        if kind != "sc" and not _is_headless_main_candidate(p):
+            continue
+        try:
+            with FileSource(p) as fs:
+                probe = probe_split_header(fs, os.path.getsize(p))
+        except OSError:
+            probe = None
+        if probe is None:
+            continue
+        d = os.path.dirname(p)
+        if probe.kind == "headless_main":
+            # A headless main has no readable content id; use its filename stem.
+            mains.append((p, d, probe.pfs_image_size, _content_id_from_filename(p)))
+        elif probe.kind == "sc" and kind == "sc":
+            scs.append((p, d, probe.pfs_image_size, probe.content_id))
+
+    sources: List[dict] = []
+    consumed = set()
+    for sc_path, sc_dir, sc_pfs, sc_cid in scs:
+        candidates = [
+            (mp, mcid) for mp, md, mp_pfs, mcid in mains
+            if md == sc_dir and mp_pfs == sc_pfs
+        ]
+        if not candidates:
+            continue  # no same-dir, same-size main -> not a completable split
+        main_path, _mcid = max(candidates, key=lambda c: _content_id_affinity(sc_cid, c[1]))
+        # SC-driven identity: name the package after the SC (its region/content id).
+        name = os.path.basename(sc_path)
+        if name.lower().endswith("_sc.pkg"):
+            name = name[: -len("_sc.pkg")] + ".pkg"
+        sources.append({"name": name, "parts": [main_path, sc_path], "split": True})
+        consumed.add(sc_path)
+        consumed.add(main_path)
+
+    remaining = [p for p in paths if p not in consumed]
+    return sources, remaining
+
+
+def _is_headless_main_candidate(path: str) -> bool:
+    """A plain (non-_sc, non-numbered) .pkg that could be a headless main.
+
+    Cheap name-level gate so we only probe files that aren't SC tails or chunks;
+    ``probe_split_header`` makes the actual headless-main determination.
+    """
+    kind, _stem, _idx = _classify_piece(path)
+    return kind == "base"
+
+
+def _publisher_code(content_id: str) -> str:
+    """The 4-digit publisher number of a content id (chars 2-6).
+
+    A content id starts with ``<2-letter region><4-digit publisher>`` (e.g.
+    ``UP4381`` / ``EP4381``). The region differs across a title's regional
+    editions but the publisher number is shared, so it is the strongest
+    cross-region link between a main and its SC. Returns "" if not present.
+    """
+    if len(content_id) < 6:
+        return ""
+    code = content_id[2:6]
+    return code if code.isdigit() else ""
+
+
+def _content_id_affinity(a: str, b: str) -> int:
+    """Similarity of two content ids, used to pick an SC's main among ties.
+
+    Weighted so the strongest structural links dominate:
+      * exact content id        -> the largest score (same package),
+      * matching publisher code  -> a large bonus (same title across regions;
+        e.g. ``UP4381`` vs ``EP4381`` -- region differs, publisher ``4381``
+        matches), then
+      * shared trailing label    -> a smaller bonus (``ELDENRING0000000`` etc.),
+      * shared leading characters of the whole id -> the final tiebreaker.
+    """
+    if a and a == b:
+        return 10_000_000
+    score = 0
+    pa, pb = _publisher_code(a), _publisher_code(b)
+    if pa and pa == pb:
+        score += 1_000_000
+    la, lb = content_label_from_content_id(a), content_label_from_content_id(b)
+    if la and la == lb:
+        score += 100_000
+    for ca, cb in zip(a, b):
+        if ca != cb:
+            break
+        score += 1
+    return score
 
 
 def scan_one(source: dict, icon_dir: Optional[str]) -> PkgRecord:
@@ -353,13 +490,23 @@ def scan_one(source: dict, icon_dir: Optional[str]) -> PkgRecord:
         pkg = Pkg.open_split(list(zip(parts, sizes))) if split else Pkg.open(primary)
         with pkg:
             marriage = pkg.marriage_digest()
-            # Delta patches carry only a chunk-copy map (not installable here);
-            # SC segments are metadata-only tails. Both are hidden from the UI.
+            # A metadata fragment is a tail-less CNT: it declares a package far
+            # larger than the bytes present, so its PFS image lives in a separate
+            # main. That is only valid as the SC half of a split -- which, if it
+            # was pairable, has already been combined into a multi-part source and
+            # never reaches here as a standalone. A single-file fragment therefore
+            # has no main and is a broken/incomplete package: surface it as an
+            # error the user can see rather than silently dropping it.
+            if not split and pkg.is_metadata_fragment(total):
+                raise PkgError(
+                    "incomplete package: tail-less metadata container (no PFS image "
+                    "present and no matching main to complete it)"
+                )
+            # Delta patches carry only a chunk-copy map (not installable here) and
+            # are hidden from the UI.
             hidden_reason = ""
             if pkg.is_delta_patch:
                 hidden_reason = "delta patch"
-            elif pkg.is_metadata_fragment(total):
-                hidden_reason = "metadata fragment (sc)"
             icon_name: Optional[str] = None
             if icon_dir is not None and pkg.has_icon0():
                 try:
