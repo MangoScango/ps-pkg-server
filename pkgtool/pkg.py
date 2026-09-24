@@ -132,6 +132,10 @@ CONTENT_TYPES_PS5 = {
     0x23: "DP",  # delta patch
 }
 
+# From samples, not from any known enum: PS4 types run 0x1A-0x1E, PS5 0x20 and up.
+# 0x26 turns up on system apps (YouTube).
+_PS5_CONTENT_TYPE_MIN = 0x20
+
 # Content-flag bits (header 0x78). Only the flags we actually rely on -- the
 # LibProsperoPkg "content classification" bits (GD_BASE 0x00020000 / GD_AC
 # 0x02000000) proved inconsistent across real samples (retail DLC and retail
@@ -691,10 +695,7 @@ def _parse(source: ByteSource) -> Pkg:
         # First occurrence wins if duplicated.
         entries.setdefault(eid, entry)
 
-    # Platform: PS5 if a param.json entry exists (or we came in via FIH/LIH),
-    # else PS4.
-    is_ps5 = ENTRY_PARAM_JSON in entries or cnt_base != 0
-    platform = "PS5" if is_ps5 else "PS4"
+    platform = detect_platform(cnt_base, content_type, entries)
 
     pkg = Pkg(
         platform=platform,
@@ -893,6 +894,21 @@ def classify_kind_ps5(content_flags: int, content_type: int) -> str:
     if content_flags & _FLAG_NON_GAME:
         return "App"
     return "Game"
+
+
+def detect_platform(cnt_base: int, content_type: int, entries: Dict[int, PkgEntry]) -> str:
+    """Return "PS4" or "PS5", using the FIH/LIH wrapper, then content_type, then
+    the metadata entry."""
+    if cnt_base != 0:
+        return "PS5"
+    if content_type >= _PS5_CONTENT_TYPE_MIN:
+        return "PS5"
+    # param.sfo takes precedence: some PS4 packages also carry a param.json.
+    if ENTRY_PARAM_SFO in entries:
+        return "PS4"
+    if ENTRY_PARAM_JSON in entries:
+        return "PS5"
+    return "PS4"
 
 
 def detect_edition(

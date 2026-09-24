@@ -523,6 +523,36 @@ def test_fih_bad_version_rejected():
         raise AssertionError("expected PkgError for unsupported FIH version")
 
 
+def test_ps4_pkg_with_param_json_is_ps4():
+    # Some PS4 packages carry a param.json (gameIntent only) next to param.sfo.
+    import json
+
+    values = {"TITLE": "ELDEN RING NIGHTREIGN", "TITLE_ID": "CUSA50615",
+              "VERSION": "01.00", "APP_VER": "01.23", "CATEGORY": "gd"}
+    game_intent = json.dumps({"gameIntent": {"permittedIntents": [{"intentType": "joinSession"}]}}).encode()
+    img = build_pkg(values, extra_entries=[(0x2000, game_intent)])
+    with Pkg.from_source(BytesSource(img)) as pkg:
+        assert pkg.platform == "PS4"
+        assert pkg.title == "ELDEN RING NIGHTREIGN"
+        assert pkg.version == "01.23"
+        assert pkg.kind == "Game"
+
+
+def test_detect_platform():
+    from pkgtool.pkg import detect_platform, ENTRY_PARAM_SFO, ENTRY_PARAM_JSON, PkgEntry
+
+    def ents(*ids):
+        return {i: PkgEntry(id=i, name_offset=0, flags1=0, flags2=0, offset=0, size=0) for i in ids}
+
+    # A FIH/LIH wrapper outranks the PS4-range content_type and param.sfo.
+    assert detect_platform(0x10000, 0x1A, ents(ENTRY_PARAM_SFO)) == "PS5"
+    # PS4 content types are 0x1A-0x1E, PS5 0x20+ (0x26 is unmapped but PS5).
+    assert detect_platform(0, 0x20, ents()) == "PS5"
+    assert detect_platform(0, 0x26, ents()) == "PS5"
+    assert detect_platform(0, 0x1A, ents(ENTRY_PARAM_SFO, ENTRY_PARAM_JSON)) == "PS4"
+    assert detect_platform(0, 0x00, ents(ENTRY_PARAM_JSON)) == "PS5"
+
+
 def test_probe_split_header_classification():
     from pkgtool.pkg import probe_split_header, BytesSource
 
