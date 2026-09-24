@@ -38,6 +38,7 @@ class PkgRecord:
     title: Optional[str]
     title_id: Optional[str]
     version: Optional[str]
+    min_sdk: Optional[str]
     category: Optional[str]
     content_type: str
     kind: str
@@ -530,6 +531,7 @@ def scan_one(source: dict, icon_dir: Optional[str]) -> PkgRecord:
                 title=pkg.title,
                 title_id=pkg.title_id,
                 version=pkg.version,
+                min_sdk=pkg.min_sdk,
                 category=pkg.category,
                 content_type=pkg.content_type_name,
                 kind=pkg.kind,
@@ -552,6 +554,7 @@ def scan_one(source: dict, icon_dir: Optional[str]) -> PkgRecord:
             title=None,
             title_id=None,
             version=None,
+            min_sdk=None,
             category=None,
             content_type="",
             kind="",

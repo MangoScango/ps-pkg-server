@@ -358,6 +358,16 @@ class Pkg:
         return self.sfo.get("APP_VER") or self.sfo.get("VERSION")
 
     @property
+    def min_sdk(self) -> Optional[str]:
+        """Minimum system software version required to install, e.g. "11.50".
+
+        None when the package declares none, which is normal for PS4 DLC/themes.
+        """
+        if self.platform == "PS5":
+            return _version_from_hex(self.param.get("requiredSystemSoftwareVersion"))
+        return _version_from_u32(self.sfo.get("SYSTEM_VER"))
+
+    @property
     def category(self) -> Optional[str]:
         if self.platform == "PS5":
             v = self.param.get("applicationCategoryType")
@@ -778,6 +788,34 @@ def content_label_from_content_id(content_id: str) -> str:
         return ""
     dash = content_id.rfind("-")
     return content_id[dash + 1 :] if dash >= 0 else content_id
+
+
+def _bcd_major_minor(major: int, minor: int) -> str:
+    """Format a BCD major/minor byte pair, e.g. (0x11, 0x50) -> "11.50"."""
+    return "%x.%02x" % (major, minor)
+
+
+def _version_from_u32(value) -> Optional[str]:
+    """PS4 SYSTEM_VER: BCD major/minor in the top two bytes (0x11500000 -> 11.50)."""
+    if value is None:
+        return None
+    try:
+        v = int(value) & 0xFFFFFFFF
+    except (TypeError, ValueError):
+        return None
+    return _bcd_major_minor((v >> 24) & 0xFF, (v >> 16) & 0xFF)
+
+
+def _version_from_hex(value) -> Optional[str]:
+    """PS5 requiredSystemSoftwareVersion: hex string, BCD major/minor in the top
+    two bytes ("0x0403000000000000" -> 4.03)."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        v = int(value, 16)
+    except ValueError:
+        return None
+    return _bcd_major_minor((v >> 56) & 0xFF, (v >> 48) & 0xFF)
 
 
 def parse_sfo(data: bytes) -> Dict[str, object]:

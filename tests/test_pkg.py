@@ -553,6 +553,39 @@ def test_detect_platform():
     assert detect_platform(0, 0x00, ents(ENTRY_PARAM_JSON)) == "PS5"
 
 
+def test_min_sdk_ps4_system_ver():
+    base = {"TITLE": "T", "TITLE_ID": "CUSA1", "VERSION": "01.00", "CATEGORY": "gd"}
+    for system_ver, expected in [(0x11500000, "11.50"), (0x04008000, "4.00"),
+                                 (0x01070000, "1.07"), (0x00000000, "0.00")]:
+        img = build_pkg(dict(base, SYSTEM_VER=system_ver))
+        with Pkg.from_source(BytesSource(img)) as pkg:
+            assert pkg.min_sdk == expected, hex(system_ver)
+    # PS4 DLC and themes commonly declare no minimum at all.
+    with Pkg.from_source(BytesSource(build_pkg(base))) as pkg:
+        assert pkg.min_sdk is None
+
+
+def test_min_sdk_ps5_required_system_software():
+    def param(**extra):
+        p = {"titleId": "PPSA00001",
+             "localizedParameters": {"defaultLanguage": "en", "en": {"titleName": "X"}}}
+        p.update(extra)
+        return p
+
+    for raw, expected in [("0x0403000000000000", "4.03"), ("0x0840000000000000", "8.40"),
+                          ("0x0960000000000000", "9.60"), ("0x0000000000000000", "0.00")]:
+        img = build_ps5_pkg(param(requiredSystemSoftwareVersion=raw))
+        with Pkg.from_source(BytesSource(img)) as pkg:
+            assert pkg.min_sdk == expected, raw
+    with Pkg.from_source(BytesSource(build_ps5_pkg(param()))) as pkg:
+        assert pkg.min_sdk is None
+    # sdkVersion is a different value and must not be used as the minimum.
+    img = build_ps5_pkg(param(sdkVersion="0x0800000000000000",
+                              requiredSystemSoftwareVersion="0x0960000000000000"))
+    with Pkg.from_source(BytesSource(img)) as pkg:
+        assert pkg.min_sdk == "9.60"
+
+
 def test_probe_split_header_classification():
     from pkgtool.pkg import probe_split_header, BytesSource
 

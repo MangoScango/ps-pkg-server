@@ -98,6 +98,16 @@ def _edition_badge(edition: Optional[str]) -> str:
     return f"<span class='badge ed-{edition.lower()}'>{html.escape(edition)}</span>"
 
 
+def _min_sdk_html(min_sdk: Optional[str]) -> str:
+    """Minimum system software version, appended to a member's detail line."""
+    if not min_sdk:
+        return ""
+    return (
+        " &middot; <span class='minsdk' title='Minimum system software version'>"
+        f"SDK {html.escape(min_sdk)}</span>"
+    )
+
+
 def _compat_badge(compat: Optional[str]) -> str:
     """Base<->update compatibility badge (PS4 marriage check)."""
     if compat == "married":
@@ -141,7 +151,7 @@ def _render_index(result: Optional[ScanResult]) -> str:
                       <div class="micon">{_icon_tag(m.icon, small=True)}</div>
                       <div class="minfo">
                         <div class="mtitle"><span class="mname">{html.escape(m.title or m.filename)}</span>{_badge(m.kind)}{_edition_badge(m.edition)}{_compat_badge(m.compat)}</div>
-                        <div class="msub">v{html.escape(m.version or '-')} &middot; {_fmt_size(m.size)} &middot; {html.escape(m.content_id or '-')}</div>
+                        <div class="msub">v{html.escape(m.version or '-')}{_min_sdk_html(m.min_sdk)} &middot; {_fmt_size(m.size)} &middot; {html.escape(m.content_id or '-')}</div>
                         <div class="path" title="{html.escape(m.path)}">{html.escape(m.filename)}</div>
                       </div>
                       <div class="mstatus"></div>
@@ -227,6 +237,7 @@ def _render_index(result: Optional[ScanResult]) -> str:
   .mname {{ overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }}
   .mtitle .badge {{ flex: 0 0 auto; }}
   .msub {{ font-size: 11px; color: #7c828a; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+  .minsdk {{ color: #9ca3af; }}
   .mactions {{ display: flex; align-items: center; gap: 6px; flex: 0 0 auto; }}
   .btn {{ margin: 0; width: 34px; height: 34px; padding: 0; display: inline-flex; align-items: center; justify-content: center; font-size: 16px; border-radius: 8px; text-decoration: none; }}
   .btn.dl {{ background: #374151; color: #e8eaed; }}
