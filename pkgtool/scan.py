@@ -39,6 +39,7 @@ class PkgRecord:
     title_id: Optional[str]
     version: Optional[str]
     min_sdk: Optional[str]
+    min_ps5_fw: Optional[str]
     category: Optional[str]
     content_type: str
     kind: str
@@ -532,6 +533,7 @@ def scan_one(source: dict, icon_dir: Optional[str]) -> PkgRecord:
                 title_id=pkg.title_id,
                 version=pkg.version,
                 min_sdk=pkg.min_sdk,
+                min_ps5_fw=pkg.min_ps5_fw,
                 category=pkg.category,
                 content_type=pkg.content_type_name,
                 kind=pkg.kind,
@@ -555,6 +557,7 @@ def scan_one(source: dict, icon_dir: Optional[str]) -> PkgRecord:
             title_id=None,
             version=None,
             min_sdk=None,
+            min_ps5_fw=None,
             category=None,
             content_type="",
             kind="",

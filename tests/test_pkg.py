@@ -586,6 +586,40 @@ def test_min_sdk_ps5_required_system_software():
         assert pkg.min_sdk == "9.60"
 
 
+def test_ps5_firmware_for_ps4_system_ver():
+    from pkgtool.pkg import ps5_firmware_for_ps4_system_ver as lookup
+
+    # First PS5 release already covers PS4 7.59, so anything at or below maps to 1.00.
+    assert lookup(0x00000000) == "1.00"
+    assert lookup(0x04500000) == "1.00"
+    assert lookup(0x07590001) == "1.00"
+    # Just past a boundary moves to the next PS5 version that raised the level.
+    assert lookup(0x08000000) == "2.00"
+    assert lookup(0x08500000) == "3.00"
+    assert lookup(0x09500000) == "5.00"
+    assert lookup(0x11500000) == "9.00"
+    # Patch/flag bits in the low half are ignored.
+    assert lookup(0x11508000) == lookup(0x11500000)
+    # Beyond every known PS5 compatibility level.
+    assert lookup(0x14000000) is None
+    assert lookup(None) is None
+
+
+def test_min_ps5_fw():
+    base = {"TITLE": "T", "TITLE_ID": "CUSA1", "VERSION": "01.00", "CATEGORY": "gd"}
+    with Pkg.from_source(BytesSource(build_pkg(dict(base, SYSTEM_VER=0x11500000)))) as pkg:
+        assert pkg.min_sdk == "11.50"
+        assert pkg.min_ps5_fw == "9.00"
+    # No declared PS4 minimum -> nothing to map.
+    with Pkg.from_source(BytesSource(build_pkg(base))) as pkg:
+        assert pkg.min_ps5_fw is None
+    # A PS5 package already states a PS5 requirement.
+    param = {"titleId": "PPSA00001", "requiredSystemSoftwareVersion": "0x0840000000000000",
+             "localizedParameters": {"defaultLanguage": "en", "en": {"titleName": "X"}}}
+    with Pkg.from_source(BytesSource(build_ps5_pkg(param))) as pkg:
+        assert pkg.min_ps5_fw == "8.40" == pkg.min_sdk
+
+
 def test_probe_split_header_classification():
     from pkgtool.pkg import probe_split_header, BytesSource
 

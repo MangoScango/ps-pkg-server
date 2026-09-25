@@ -368,6 +368,18 @@ class Pkg:
         return _version_from_u32(self.sfo.get("SYSTEM_VER"))
 
     @property
+    def min_ps5_fw(self) -> Optional[str]:
+        """Minimum PS5 system software able to run this package.
+
+        For a PS5 package that is its own declared requirement; for a PS4 package
+        it is the lowest PS5 version whose backward-compatibility level covers the
+        PS4 SYSTEM_VER.
+        """
+        if self.platform == "PS5":
+            return self.min_sdk
+        return ps5_firmware_for_ps4_system_ver(self.sfo.get("SYSTEM_VER"))
+
+    @property
     def category(self) -> Optional[str]:
         if self.platform == "PS5":
             v = self.param.get("applicationCategoryType")
@@ -788,6 +800,47 @@ def content_label_from_content_id(content_id: str) -> str:
         return ""
     dash = content_id.rfind("-")
     return content_id[dash + 1 :] if dash >= 0 else content_id
+
+
+# The PS4 compatibility level each PS5 system software ships, as
+# (ps5_system_software, ps4_system_ver_stamp). A PS5 can host a PS4 package when
+# its stamp is at least the package's SYSTEM_VER. Only the versions that raised
+# the level are listed, so the first covering row is the lowest PS5 version.
+_PS5_PS4_COMPAT_LEVELS = (
+    ("1.00", 0x07590001),
+    ("2.00", 0x08050001),
+    ("3.00", 0x08540001),
+    ("4.00", 0x09040001),
+    ("4.50", 0x09090001),
+    ("5.00", 0x09590001),
+    ("5.02", 0x09690001),
+    ("6.00", 0x10090001),
+    ("7.01", 0x10590001),
+    ("7.40", 0x10790001),
+    ("8.00", 0x11090001),
+    ("9.00", 0x11590001),
+    ("10.01", 0x12090001),
+    ("11.00", 0x12590001),
+    ("12.00", 0x13090001),
+)
+
+
+def ps5_firmware_for_ps4_system_ver(system_ver) -> Optional[str]:
+    """Lowest PS5 system software able to host a PS4 package needing ``system_ver``.
+
+    None when no known PS5 version reaches that level. Only major/minor are
+    compared; the low bytes of a SYSTEM_VER are patch/flag bits.
+    """
+    if system_ver is None:
+        return None
+    try:
+        want = (int(system_ver) >> 16) & 0xFFFF
+    except (TypeError, ValueError):
+        return None
+    for ps5_version, stamp in _PS5_PS4_COMPAT_LEVELS:
+        if (stamp >> 16) & 0xFFFF >= want:
+            return ps5_version
+    return None
 
 
 def _bcd_major_minor(major: int, minor: int) -> str:

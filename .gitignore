@@ -17,3 +17,4 @@ _[!_]*.py
 # Local config
 .env
 *.pkg
+ps-pkg-server.code-workspace

@@ -98,14 +98,31 @@ def _edition_badge(edition: Optional[str]) -> str:
     return f"<span class='badge ed-{edition.lower()}'>{html.escape(edition)}</span>"
 
 
-def _min_sdk_html(min_sdk: Optional[str]) -> str:
-    """Minimum system software version, appended to a member's detail line."""
-    if not min_sdk:
-        return ""
-    return (
-        " &middot; <span class='minsdk' title='Minimum system software version'>"
-        f"SDK {html.escape(min_sdk)}</span>"
-    )
+def _firmware_html(platform: Optional[str], min_sdk: Optional[str],
+                   min_ps5_fw: Optional[str]) -> str:
+    """Minimum-firmware segments for a member's detail line.
+
+    A PS5 package shows its own requirement; a PS4 package shows the PS4 level it
+    needs plus the lowest PS5 system software that can host it.
+    """
+    out = ""
+    if platform == "PS4":
+        if min_sdk:
+            out += (
+                " &middot; <span title='Minimum PS4 system software version'>"
+                f"PS4 {html.escape(min_sdk)}</span>"
+            )
+        if min_ps5_fw:
+            out += (
+                " &middot; <span title='Lowest PS5 system software that can run this'>"
+                f"PS5 {html.escape(min_ps5_fw)}</span>"
+            )
+    elif min_sdk:
+        out += (
+            " &middot; <span title='Minimum system software version'>"
+            f"FW {html.escape(min_sdk)}</span>"
+        )
+    return out
 
 
 def _compat_badge(compat: Optional[str]) -> str:
@@ -151,7 +168,7 @@ def _render_index(result: Optional[ScanResult]) -> str:
                       <div class="micon">{_icon_tag(m.icon, small=True)}</div>
                       <div class="minfo">
                         <div class="mtitle"><span class="mname">{html.escape(m.title or m.filename)}</span>{_badge(m.kind)}{_edition_badge(m.edition)}{_compat_badge(m.compat)}</div>
-                        <div class="msub">v{html.escape(m.version or '-')}{_min_sdk_html(m.min_sdk)} &middot; {_fmt_size(m.size)} &middot; {html.escape(m.content_id or '-')}</div>
+                        <div class="msub">v{html.escape(m.version or '-')}{_firmware_html(m.platform, m.min_sdk, m.min_ps5_fw)} &middot; {_fmt_size(m.size)} &middot; {html.escape(m.content_id or '-')}</div>
                         <div class="path" title="{html.escape(m.path)}">{html.escape(m.filename)}</div>
                       </div>
                       <div class="mstatus"></div>
@@ -237,7 +254,6 @@ def _render_index(result: Optional[ScanResult]) -> str:
   .mname {{ overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }}
   .mtitle .badge {{ flex: 0 0 auto; }}
   .msub {{ font-size: 11px; color: #7c828a; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
-  .minsdk {{ color: #9ca3af; }}
   .mactions {{ display: flex; align-items: center; gap: 6px; flex: 0 0 auto; }}
   .btn {{ margin: 0; width: 34px; height: 34px; padding: 0; display: inline-flex; align-items: center; justify-content: center; font-size: 16px; border-radius: 8px; text-decoration: none; }}
   .btn.dl {{ background: #374151; color: #e8eaed; }}
