@@ -917,6 +917,293 @@ def test_group_sources_orphan_sc_and_main_left_alone():
         }
 
 
+CLOUD_CSV = """entitlement_id,title,title_id,package_url,platform,content_type
+UP0700-PPSA04610_00-ELDENRING0000000,ELDEN RING,PPSA04610,https://sgst.example/abc-version.xml,ps5,game
+UP0700-CUSA28863_00-ELDENRING0000000,ELDEN RING PS4,CUSA28863,http://gs2.example/UP0700-CUSA28863_00-ELDENRING0000000.json,ps4,game
+"""
+
+CLOUD_XML = b"""<?xml version="1.0" encoding="UTF-8"?><title_patch nptitleid="PPSA04610_00">
+    <app_tag content_id="UP0700-PPSA04610_00-ELDENRING0000000">
+        <package content_ver="01.018.001" manifest_url="https://sgst.example/app.json"/>
+    </app_tag>
+    <ac_tag content_id="UP0700-PPSA04610_00-ELDENRINGDLC0000">
+        <package content_ver="01.000.000" manifest_url="https://sgst.example/dlc.json"/>
+    </ac_tag>
+</title_patch>
+"""
+
+
+def _cloud_client(root):
+    """Reload the app with a cloud catalogue in place and return a TestClient."""
+    import importlib
+
+    csv_path = os.path.join(root, "cloud.csv")
+    with open(csv_path, "w", encoding="utf-8") as f:
+        f.write(CLOUD_CSV)
+    _write_pkgs(root)
+    os.environ["PKG_DIRS"] = root
+    os.environ["ICON_DIR"] = os.path.join(root, "_icons")
+    os.environ["ENTITLEMENTS_CSV"] = csv_path
+
+    import app as app_module
+    importlib.reload(app_module)
+    from fastapi.testclient import TestClient
+    return app_module, TestClient(app_module.app)
+
+
+def test_cloud_search_and_resolve():
+    with tempfile.TemporaryDirectory() as root:
+        app_module, client = _cloud_client(root)
+        with client:
+            j = client.get("/api/cloud/search?q=elden").json()
+            assert j["ok"] is True
+            assert j["total"] == 2
+            assert {r["url_kind"] for r in j["results"]} == {"xml", "json"}
+
+            # Platform filter narrows the same query.
+            j = client.get("/api/cloud/search?q=elden&platform=ps5").json()
+            assert [r["platform"] for r in j["results"]] == ["ps5"]
+            j = client.get("/api/cloud/search?q=elden&platform=ps4").json()
+            assert [r["platform"] for r in j["results"]] == ["ps4"]
+            assert client.get("/api/cloud/search?q=elden&platform=ps3").status_code == 400
+
+            # A json row resolves without any network access.
+            j = client.post(
+                "/api/cloud/resolve",
+                json={"entitlement_id": "UP0700-CUSA28863_00-ELDENRING0000000"},
+            ).json()
+            assert j["ok"] is True and j["url_kind"] == "json"
+            assert len(j["packages"]) == 1
+
+            # An xml row resolves to the app plus its additional content.
+            app_module.entitlements.fetch = lambda url, timeout=20: CLOUD_XML
+            j = client.post(
+                "/api/cloud/resolve",
+                json={"entitlement_id": "UP0700-PPSA04610_00-ELDENRING0000000"},
+            ).json()
+            assert j["ok"] is True and j["url_kind"] == "xml"
+            assert [(p["kind"], p["content_ver"]) for p in j["packages"]] == [
+                ("Game", "01.018.001"), ("DLC", "01.000.000")
+            ]
+
+            assert client.post(
+                "/api/cloud/resolve", json={"entitlement_id": "nope"}
+            ).status_code == 404
+
+
+def test_cloud_push_hands_manifest_url_to_console():
+    """The console is given the Sony manifest URL, not a local download URL."""
+    import json
+    import socket
+    import threading
+
+    with tempfile.TemporaryDirectory() as root:
+        _app_module, client = _cloud_client(root)
+        with client:
+            received = {}
+            srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            srv.bind(("127.0.0.1", 0))
+            srv.listen(1)
+            port = srv.getsockname()[1]
+
+            def accept():
+                conn, _ = srv.accept()
+                conn.settimeout(3)
+                data = b""
+                try:
+                    while True:
+                        chunk = conn.recv(1024)
+                        if not chunk:
+                            break
+                        data += chunk
+                        try:
+                            json.loads(data.decode("utf-8"))
+                            break
+                        except ValueError:
+                            continue
+                except (OSError, socket.timeout):
+                    pass
+                received["data"] = data.decode("utf-8", "replace")
+                conn.sendall(b'{"res":"0"}')
+                conn.close()
+
+            t = threading.Thread(target=accept)
+            t.start()
+            resp = client.post(
+                "/api/cloud/push",
+                json={
+                    "console_ip": "127.0.0.1",
+                    "console_port": port,
+                    "protocol": "etahen_v1",
+                    "manifest_url": "https://sgst.example/app.json",
+                    "content_id": "UP0700-PPSA04610_00-ELDENRING0000000",
+                    "name": "ELDEN RING",
+                },
+            )
+            t.join(timeout=5)
+            srv.close()
+
+            body = resp.json()
+            assert body["ok"] is True, body
+            assert body["url"] == "https://sgst.example/app.json"
+            sent = json.loads(received["data"])
+            assert sent["url"] == "https://sgst.example/app.json"
+            assert sent["content_id"] == "UP0700-PPSA04610_00-ELDENRING0000000"
+
+
+def test_cloud_status_and_reload_without_catalogue():
+    """An absent catalogue reports itself rather than erroring, and reload picks
+    one up without a restart. A direct URL still works meanwhile."""
+    import importlib
+
+    with tempfile.TemporaryDirectory() as root:
+        csv_path = os.path.join(root, "later.csv")
+        _write_pkgs(root)
+        os.environ["PKG_DIRS"] = root
+        os.environ["ICON_DIR"] = os.path.join(root, "_icons")
+        os.environ["ENTITLEMENTS_CSV"] = csv_path
+
+        import app as app_module
+        importlib.reload(app_module)
+        from fastapi.testclient import TestClient
+
+        with TestClient(app_module.app) as client:
+            s = client.get("/api/cloud/status").json()
+            assert s["available"] is False and s["count"] == 0
+            assert s["path"] == os.path.abspath(csv_path)
+            assert s["source_url"].startswith("https://")
+            # Search says "not configured", not "failed".
+            assert client.get("/api/cloud/search?q=elden").status_code == 503
+            # A pasted URL needs no catalogue.
+            assert client.post(
+                "/api/cloud/resolve", json={"url": "https://example.com/a/GAME.pkg"}
+            ).json()["ok"] is True
+
+            with open(csv_path, "w", encoding="utf-8") as f:
+                f.write(CLOUD_CSV)
+            s = client.post("/api/cloud/reload").json()
+            assert s["available"] is True and s["count"] == 2
+            assert client.get("/api/cloud/search?q=elden").json()["total"] == 2
+
+
+def test_cloud_upload():
+    """Uploading a CSV stores it at the configured path and loads it."""
+    import importlib
+
+    with tempfile.TemporaryDirectory() as root:
+        csv_path = os.path.join(root, "nested", "cat.csv")
+        _write_pkgs(root)
+        os.environ["PKG_DIRS"] = root
+        os.environ["ICON_DIR"] = os.path.join(root, "_icons")
+        os.environ["ENTITLEMENTS_CSV"] = csv_path
+
+        import app as app_module
+        importlib.reload(app_module)
+        from fastapi.testclient import TestClient
+
+        with TestClient(app_module.app) as client:
+            assert client.get("/api/cloud/status").json()["available"] is False
+            r = client.post(
+                "/api/cloud/upload",
+                content=CLOUD_CSV.encode("utf-8"),
+                headers={"Content-Type": "text/csv"},
+            )
+            body = r.json()
+            assert r.status_code == 200 and body["ok"] is True
+            assert body["count"] == 2
+            # Written to the configured path, creating parent dirs as needed.
+            assert os.path.exists(csv_path)
+            assert client.get("/api/cloud/search?q=elden").json()["total"] == 2
+            # No temp file left behind.
+            assert not os.path.exists(csv_path + ".part")
+
+
+def test_cloud_upload_rejects_bad_csv_without_clobbering():
+    """A rejected upload leaves an existing catalogue untouched."""
+    import importlib
+
+    with tempfile.TemporaryDirectory() as root:
+        csv_path = os.path.join(root, "cat.csv")
+        with open(csv_path, "w", encoding="utf-8") as f:
+            f.write(CLOUD_CSV)
+        _write_pkgs(root)
+        os.environ["PKG_DIRS"] = root
+        os.environ["ICON_DIR"] = os.path.join(root, "_icons")
+        os.environ["ENTITLEMENTS_CSV"] = csv_path
+
+        import app as app_module
+        importlib.reload(app_module)
+        from fastapi.testclient import TestClient
+
+        original = open(csv_path, "rb").read()
+        with TestClient(app_module.app) as client:
+            assert client.get("/api/cloud/status").json()["count"] == 2
+            cases = [
+                (b"", 400),                                        # empty
+                (b"a,b\n1,2\n", 400),                              # wrong columns
+                (b"entitlement_id,package_url\n", 400),            # header only
+                (b"entitlement_id,package_url\nX,\n", 400),        # no usable rows
+                (b"\xff\xfe\x00nope", 400),                        # not UTF-8
+            ]
+            for payload, expected in cases:
+                r = client.post(
+                    "/api/cloud/upload",
+                    content=payload,
+                    headers={"Content-Type": "text/csv"},
+                )
+                assert r.status_code == expected, (payload[:20], r.status_code)
+                assert r.json()["ok"] is False
+            # Catalogue and file both survived every rejection.
+            assert client.get("/api/cloud/status").json()["count"] == 2
+            assert open(csv_path, "rb").read() == original
+
+
+def test_cloud_resolve_arbitrary_url():
+    """A pasted URL resolves without being in the catalogue."""
+    with tempfile.TemporaryDirectory() as root:
+        app_module, client = _cloud_client(root)
+        with client:
+            # A .json URL is already a manifest.
+            j = client.post(
+                "/api/cloud/resolve", json={"url": "https://example.com/x/MYPKG.json"}
+            ).json()
+            assert j["ok"] is True and j["url_kind"] == "json"
+            assert j["packages"][0]["manifest_url"] == "https://example.com/x/MYPKG.json"
+            assert j["packages"][0]["name"] == "MYPKG.json"
+
+            # A .xml URL is fetched and may offer several packages.
+            app_module.entitlements.fetch = lambda url, timeout=20: CLOUD_XML
+            j = client.post(
+                "/api/cloud/resolve", json={"url": "https://example.com/abc-version.xml"}
+            ).json()
+            assert j["ok"] is True and j["url_kind"] == "xml"
+            assert [p["kind"] for p in j["packages"]] == ["Game", "DLC"]
+
+            # A direct .pkg is installable as-is.
+            j = client.post(
+                "/api/cloud/resolve", json={"url": "https://example.com/a/GAME.pkg"}
+            ).json()
+            assert j["ok"] is True and j["url_kind"] == "pkg"
+            assert j["packages"][0]["manifest_url"] == "https://example.com/a/GAME.pkg"
+
+            for bad in ("ftp://x/y.json", "https://x/y.txt", "notaurl"):
+                assert client.post("/api/cloud/resolve", json={"url": bad}).status_code == 400
+
+
+def test_cloud_push_rejects_bad_input():
+    with tempfile.TemporaryDirectory() as root:
+        _app_module, client = _cloud_client(root)
+        with client:
+            base = {"console_ip": "127.0.0.1", "console_port": 9040}
+            r = client.post("/api/cloud/push", json={**base, "manifest_url": "ftp://x/y.json"})
+            assert r.status_code == 400
+            r = client.post(
+                "/api/cloud/push",
+                json={**base, "manifest_url": "https://x/y.json", "protocol": "bogus"},
+            )
+            assert r.status_code == 400
+
+
 def test_group_sources_numbered_split_with_divergent_sc_name():
     """A numbered chunk set whose SC carries a different content id is paired
     structurally, in chunk order, with the SC last."""

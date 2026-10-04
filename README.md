@@ -21,11 +21,16 @@ Then open http://localhost:8000.
 | `PKG_DIRS` | Colon-separated dirs to scan *inside* the container | `/pkgs` |
 | `SCAN_WORKERS` | Parallel parse workers | `8` |
 | `PUBLIC_HOST` | Force the `host:port` the console downloads from | auto-detect |
+| `ENTITLEMENTS_CSV` | Entitlement catalogue for cloud install | `entitlements_all.csv` |
 
 - Icons and other runtime data persist in `./data` (mounted at `/data`).
 - Add more libraries by adding `:ro` volumes in `docker-compose.yml` and listing
   them all in `PKG_DIRS` (e.g. `/pkgs:/pkgs2`).
 
+
+## Cloud install
+
+You can push retail titles directly from the CDN to your console with the cloud icon in the header. If you contribute your entitlements database to [Garlic Saves](https://garlicsaves.com/tools/entitlements), you can export the result and search through it dynamically. Afterwards upload just the `entitlements_all.csv` to the server or drop it in the scripts working directory.  Without a catalogue you can still paste a direct `.pkg`, `.json` manifest, or `version.xml` URL into the search box to install from it. 
 
 ## Special Thanks
 

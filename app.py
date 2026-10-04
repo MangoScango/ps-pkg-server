@@ -22,6 +22,7 @@ import urllib.request
 from contextlib import asynccontextmanager
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlencode
+from xml.etree import ElementTree
 
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
@@ -29,6 +30,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from pkgtool import ConcatSource
+from pkgtool import entitlements
 from pkgtool.scan import PkgRecord, ScanResult, scan, group_by_title_id
 
 ICON_DIR = os.environ.get("ICON_DIR", os.path.join("cache", "icons"))
@@ -38,6 +40,12 @@ SCAN_WORKERS = int(os.environ.get("SCAN_WORKERS", "8"))
 PUBLIC_HOST = os.environ.get("PUBLIC_HOST", "").strip()
 # How long to wait (seconds) for the console to reply with the install result code.
 PUSH_RESPONSE_TIMEOUT = float(os.environ.get("PUSH_RESPONSE_TIMEOUT", "10"))
+# Entitlement catalogue backing cloud push.
+ENTITLEMENTS_CSV = os.environ.get("ENTITLEMENTS_CSV", "entitlements_all.csv")
+# Where users export their own catalogue from.
+ENTITLEMENTS_SOURCE_URL = "https://garlicsaves.com/tools/entitlements"
+IN_CONTAINER = os.path.exists("/.dockerenv")
+ENTITLEMENTS_MAX_UPLOAD = 64 * 1024 * 1024
 
 
 def _configured_dirs() -> List[str]:
@@ -52,6 +60,17 @@ class AppState:
         self.dirs: List[str] = _configured_dirs()
         self.result: Optional[ScanResult] = None
         self.index: Dict[str, PkgRecord] = {}
+        self._entitlements: Optional[List[entitlements.Entitlement]] = None
+
+    @property
+    def entitlements(self) -> List[entitlements.Entitlement]:
+        if self._entitlements is None:
+            self._entitlements = entitlements.load(ENTITLEMENTS_CSV)
+        return self._entitlements
+
+    def reload_entitlements(self) -> List[entitlements.Entitlement]:
+        self._entitlements = None
+        return self.entitlements
 
     def rescan(self) -> ScanResult:
         self.result = scan(self.dirs, icon_dir=ICON_DIR, workers=SCAN_WORKERS)
@@ -221,6 +240,31 @@ def _render_index(result: Optional[ScanResult]) -> str:
   button {{ background: #3b82f6; color: white; border: 0; padding: 9px 16px; border-radius: 6px; cursor: pointer; font-size: 14px; }}
   button:hover {{ background: #2563eb; }}
   button.rescan {{ margin: 0; flex: 0 0 auto; white-space: nowrap; }}
+  button.cloudbtn {{ margin: 0; flex: 0 0 auto; width: 38px; height: 36px; padding: 0; display: inline-flex; align-items: center; justify-content: center; background: #374151; }}
+  button.cloudbtn:hover {{ background: #4b5563; }}
+  .modal {{ position: fixed; inset: 0; background: rgba(0,0,0,.6); z-index: 20; display: flex; align-items: flex-start; justify-content: center; padding: 60px 16px 16px; }}
+  .modal[hidden] {{ display: none; }}
+  .sheet {{ background: #1a1d22; border: 1px solid #2a2e35; border-radius: 12px; width: 100%; max-width: 680px; display: flex; flex-direction: column; max-height: 80vh; overflow: hidden; }}
+  .sheethead {{ display: flex; gap: 8px; padding: 12px; border-bottom: 1px solid #2a2e35; }}
+  .sheethead input {{ flex: 1 1 auto; min-width: 0; }}
+  .sheethead select {{ flex: 0 0 auto; }}
+  .btn.close {{ background: #374151; color: #e8eaed; font-size: 22px; line-height: 1; }}
+  .btn.close:hover {{ background: #4b5563; }}
+  .sheetbody {{ overflow-y: auto; padding: 6px; }}
+  .crow {{ display: flex; align-items: center; gap: 10px; padding: 9px 10px; border-radius: 8px; cursor: pointer; }}
+  .crow:hover {{ background: #22262c; }}
+  .crow .cmain {{ min-width: 0; flex: 1 1 auto; }}
+  .crow .cname {{ font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+  .crow .csub {{ font-size: 11px; color: #7c828a; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+  .cnote {{ padding: 14px 12px; color: #7c828a; font-size: 12px; }}
+  .csetup {{ padding: 14px 14px 18px; font-size: 12.5px; line-height: 1.55; color: #c4c8ce; }}
+  .csetup h2 {{ font-size: 13px; margin: 0 0 8px; color: #e8eaed; }}
+  .csetup ol {{ margin: 8px 0 12px; padding-left: 20px; }}
+  .csetup li {{ margin: 4px 0; }}
+  .csetup a {{ color: #93c5fd; }}
+  .csetup code {{ background: #101216; border: 1px solid #2a2e35; border-radius: 4px; padding: 1px 5px; font-size: 11.5px; word-break: break-all; }}
+  .cback {{ background: none; color: #93c5fd; padding: 6px 10px; font-size: 12px; }}
+  .cback:hover {{ background: #22262c; }}
   /* Base = single column stack (also the no-JS fallback). JS turns this into a
      row of independent column stacks (.cols + .gcol) so expanding one card only
      grows its own column instead of leaving gaps across a shared grid row. */
@@ -346,9 +390,24 @@ def _render_index(result: Optional[ScanResult]) -> str:
       <input id="cip" placeholder="Console IP" autocomplete="off" inputmode="decimal">
       <input id="cport" placeholder="Port" value="9040" autocomplete="off" inputmode="numeric">
     </div>
+    <button class="cloudbtn" onclick="cloudOpen()" title="Install from the cloud" aria-label="Install from the cloud"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 10h-1.26A8 8 0 1 0 9 20h9a5 5 0 0 0 0-10z"/></svg></button>
     <button class="rescan" onclick="rescan(this)">Rescan</button>
   </div>
 </header>
+<div id="cloud" class="modal" hidden>
+  <div class="sheet" role="dialog" aria-modal="true" aria-label="Install from the cloud">
+    <div class="sheethead">
+      <input id="cloudq" placeholder="Search titles..." autocomplete="off" spellcheck="false">
+      <select id="cloudplat" title="Filter by platform">
+        <option value="">All</option>
+        <option value="ps5">PS5</option>
+        <option value="ps4">PS4</option>
+      </select>
+      <button class="btn close" onclick="cloudClose()" aria-label="Close">&times;</button>
+    </div>
+    <div id="cloudbody" class="sheetbody"></div>
+  </div>
+</div>
 {body}
 <script>
 async function rescan(btn) {{
@@ -428,6 +487,292 @@ function resultLabel(j) {{
     title: 'Console returned ' + j.code + ' (' + j.code_hex + ')',
   }};
 }}
+
+// --- cloud push ---------------------------------------------------------
+const cloudEl = () => document.getElementById('cloud');
+const cloudBodyEl = () => document.getElementById('cloudbody');
+let cloudSeq = 0;  // discards responses from superseded searches
+
+const CLOUD_HINT = 'Search the catalogue, or paste a .pkg / .json / .xml URL to install from it.';
+
+// The catalogue is community-sourced and not shipped, so an absent one is a
+// normal first-run state rather than an error.
+function cloudSetup(status) {{
+  const body = cloudBodyEl();
+  body.innerHTML = '';
+  const wrap = document.createElement('div');
+  wrap.className = 'csetup';
+
+  const h = document.createElement('h2');
+  h.textContent = 'No entitlement catalogue loaded';
+  const p = document.createElement('p');
+  p.style.margin = '0';
+  p.textContent = 'Cloud install needs a catalogue of your own entitlements. '
+    + 'It is community tooling, so you export it yourself:';
+
+  const ol = document.createElement('ol');
+  const saveStep = status.volume
+    ? ['Save it into the ' + status.volume + ' volume, so it lands at ', null, null, status.path]
+    : ['Save it to ', null, null, status.path];
+  const steps = [
+    ['Open ', status.source_url, ' and follow the instructions to ingest your console\u2019s entitlement database.'],
+    ['Export the result as CSV.'],
+    saveStep,
+    ['Reload below (no restart needed).'],
+  ];
+  for (const [lead, href, tail, code] of steps) {{
+    const li = document.createElement('li');
+    li.append(document.createTextNode(lead));
+    if (href) {{
+      const a = document.createElement('a');
+      a.href = href; a.target = '_blank'; a.rel = 'noopener noreferrer';
+      a.textContent = href;
+      li.append(a);
+    }}
+    if (tail) li.append(document.createTextNode(tail));
+    if (code) {{
+      const c = document.createElement('code');
+      c.textContent = code;
+      li.append(c);
+    }}
+    ol.append(li);
+  }}
+
+  const note = document.createElement('p');
+  note.style.cssText = 'margin:0 0 12px; color:#7c828a;';
+  note.textContent = (status.volume
+      ? 'That is the path inside the container; put the file wherever ' + status.volume
+        + ' is mounted on the host. '
+      : '')
+    + 'You can still paste a direct .pkg / .json / .xml URL into the search box without a catalogue.';
+
+  const row = document.createElement('div');
+  row.style.cssText = 'display:flex; gap:8px; align-items:center;';
+
+  const upload = document.createElement('button');
+  upload.textContent = 'Upload CSV\u2026';
+  upload.addEventListener('click', () => cloudPickFile());
+
+  const reload = document.createElement('button');
+  reload.textContent = 'Reload from disk';
+  reload.style.cssText = 'background:#374151;';
+  reload.addEventListener('click', async () => {{
+    reload.disabled = true; reload.textContent = 'Reloading\u2026';
+    try {{
+      const s = await (await fetch('/api/cloud/reload', {{ method: 'POST' }})).json();
+      if (s.available) cloudReady(s);
+      else {{ cloudSetup(s); cloudFlash('Still nothing at that path.'); }}
+    }} catch (e) {{
+      reload.disabled = false; reload.textContent = 'Reload from disk';
+    }}
+  }});
+
+  row.append(upload, reload);
+  wrap.append(h, p, ol, note, row);
+  body.append(wrap);
+}}
+
+// Hand the chosen file to the server as the raw request body.
+function cloudPickFile() {{
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.accept = '.csv,text/csv';
+  input.addEventListener('change', async () => {{
+    const file = input.files && input.files[0];
+    if (!file) return;
+    cloudNote('Uploading ' + file.name + '\u2026');
+    let j;
+    try {{
+      const r = await fetch('/api/cloud/upload', {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'text/csv' }},
+        body: file
+      }});
+      j = await r.json();
+    }} catch (e) {{ j = {{ ok: false, error: String(e) }}; }}
+    if (j.ok) cloudReady(j);
+    else {{
+      cloudSetup(j.path ? j : await (await fetch('/api/cloud/status')).json());
+      cloudFlash('Upload failed: ' + (j.error || 'unknown error'));
+    }}
+  }});
+  input.click();
+}}
+
+// Catalogue is usable: show the hint plus how to swap it out.
+function cloudReady(status) {{
+  cloudNote(CLOUD_HINT);
+  const line = document.createElement('div');
+  line.className = 'cnote';
+  line.style.paddingTop = '0';
+  line.append(document.createTextNode(
+    (status && status.count ? status.count.toLocaleString() + ' entries \u00b7 ' : '')));
+  const swap = document.createElement('a');
+  swap.href = '#'; swap.textContent = 'replace catalogue';
+  swap.style.color = '#93c5fd';
+  swap.addEventListener('click', ev => {{ ev.preventDefault(); cloudPickFile(); }});
+  line.append(swap);
+  cloudBodyEl().append(line);
+  document.getElementById('cloudq').focus();
+}}
+
+function cloudFlash(msg) {{
+  const n = document.createElement('div');
+  n.className = 'cnote';
+  n.textContent = msg;
+  cloudBodyEl().append(n);
+}}
+
+async function cloudOpen() {{
+  cloudEl().hidden = false;
+  const q = document.getElementById('cloudq');
+  q.focus(); q.select();
+  let status = {{ available: true }};
+  try {{ status = await (await fetch('/api/cloud/status')).json(); }} catch (e) {{}}
+  if (!status.available) {{ cloudSetup(status); return; }}
+  if (!cloudBodyEl().innerHTML) cloudReady(status);
+}}
+
+function cloudClose() {{ cloudEl().hidden = true; }}
+
+function cloudNote(msg) {{
+  cloudBodyEl().innerHTML = '<div class="cnote"></div>';
+  cloudBodyEl().firstChild.textContent = msg;
+}}
+
+function cloudRow(onClick, name, sub) {{
+  const row = document.createElement('div');
+  row.className = 'crow';
+  const main = document.createElement('div');
+  main.className = 'cmain';
+  const n = document.createElement('div'); n.className = 'cname'; n.textContent = name;
+  const s = document.createElement('div'); s.className = 'csub'; s.textContent = sub;
+  main.append(n, s);
+  row.append(main);
+  row.addEventListener('click', onClick);
+  return row;
+}}
+
+// Pasting a URL offers a direct install instead of a catalogue search.
+function cloudUrlOption(url) {{
+  const body = cloudBodyEl();
+  body.innerHTML = '';
+  const m = url.split('?')[0].split('#')[0].match(/\\.(pkg|json|xml)$/i);
+  if (!m) {{ cloudNote('A URL must end in .pkg, .json or .xml to install from it.'); return; }}
+  const kind = m[1].toLowerCase();
+  const label = {{
+    pkg: 'Install this .pkg directly',
+    json: 'Install from this manifest',
+    xml: 'Install from this version.xml',
+  }}[kind];
+  body.append(cloudRow(() => cloudResolve({{ url: url }}), label, url));
+}}
+
+async function cloudSearch(q) {{
+  const seq = ++cloudSeq;
+  const plat = document.getElementById('cloudplat').value;
+  const r = await fetch('/api/cloud/search?limit=40&q=' + encodeURIComponent(q)
+    + (plat ? '&platform=' + encodeURIComponent(plat) : ''));
+  const j = await r.json();
+  if (seq !== cloudSeq) return;
+  if (r.status === 503) {{
+    cloudSetup(await (await fetch('/api/cloud/status')).json());
+    return;
+  }}
+  if (!j.ok) {{ cloudNote(j.error || 'search failed'); return; }}
+  if (!j.results.length) {{ cloudNote('No matches.'); return; }}
+  const body = cloudBodyEl();
+  body.innerHTML = '';
+  for (const e of j.results) {{
+    body.append(cloudRow(
+      () => cloudResolve({{ entitlement_id: e.entitlement_id }}),
+      e.title || e.entitlement_id,
+      [e.platform.toUpperCase(), e.title_id, e.entitlement_id].filter(Boolean).join(' \u00b7 ')
+    ));
+  }}
+}}
+
+// Re-render whatever the current input implies.
+function cloudRefresh() {{
+  const v = document.getElementById('cloudq').value.trim();
+  if (!v) {{ cloudNote(CLOUD_HINT); return; }}
+  if (/^https?:\\/\\//i.test(v)) cloudUrlOption(v); else cloudSearch(v);
+}}
+
+// A single manifest installs straight away; several are offered as a choice.
+async function cloudResolve(payload) {{
+  const c = getConsole(); if (!c) return;
+  cloudNote('Resolving\u2026');
+  let j;
+  try {{
+    const r = await fetch('/api/cloud/resolve', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify(payload)
+    }});
+    j = await r.json();
+  }} catch (e) {{ cloudNote(String(e)); return; }}
+  if (!j.ok) {{ cloudNote(j.error || 'could not resolve'); return; }}
+  if (j.packages.length === 1) {{ cloudPush(j.packages[0]); return; }}
+
+  const body = cloudBodyEl();
+  body.innerHTML = '';
+  const back = document.createElement('button');
+  back.className = 'cback'; back.textContent = '\u2190 back';
+  back.addEventListener('click', cloudRefresh);
+  body.append(back);
+  for (const p of j.packages) {{
+    body.append(cloudRow(
+      () => cloudPush(p),
+      [p.kind, j.title].filter(Boolean).join(' \u00b7 '),
+      [p.content_id, p.content_ver && 'v' + p.content_ver].filter(Boolean).join(' \u00b7 ')
+    ));
+  }}
+}}
+
+async function cloudPush(pkg) {{
+  const c = getConsole(); if (!c) return;
+  cloudNote('Installing ' + (pkg.content_id || pkg.name) + '\u2026');
+  let j;
+  try {{
+    const r = await fetch('/api/cloud/push', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify({{
+        console_ip: c.ip, console_port: c.port, protocol: c.proto,
+        manifest_url: pkg.manifest_url, content_id: pkg.content_id, name: pkg.name || ''
+      }})
+    }});
+    j = await r.json();
+  }} catch (e) {{ j = {{ ok: false, error: String(e) }}; }}
+  const res = resultLabel(j);
+  cloudNote(res.text + ' \u2014 ' + res.title);
+}}
+
+(() => {{
+  const q = document.getElementById('cloudq');
+  let t;
+  q.addEventListener('input', () => {{
+    clearTimeout(t);
+    const v = q.value.trim();
+    if (!v) {{ cloudNote(CLOUD_HINT); return; }}
+    // A URL needs no lookup, so render its install option immediately.
+    if (/^https?:\\/\\//i.test(v)) {{ cloudUrlOption(v); return; }}
+    t = setTimeout(() => cloudSearch(v), 200);
+  }});
+  const plat = document.getElementById('cloudplat');
+  const platKey = 'pkgserver_cloudplat';
+  const savedPlat = localStorage.getItem(platKey);
+  if (savedPlat !== null) plat.value = savedPlat;
+  plat.addEventListener('change', () => {{
+    localStorage.setItem(platKey, plat.value);
+    cloudRefresh();
+  }});
+  cloudEl().addEventListener('click', ev => {{ if (ev.target === cloudEl()) cloudClose(); }});
+  document.addEventListener('keydown', ev => {{
+    if (ev.key === 'Escape' && !cloudEl().hidden) cloudClose();
+  }});
+}})();
 
 async function push(id, btn) {{
   const c = getConsole(); if (!c) return;
@@ -706,6 +1051,219 @@ def api_push(req: PushRequest, request: Request) -> JSONResponse:
             **result,
         }
     )
+
+
+def _cloud_status() -> dict:
+    entries = state.entitlements
+    path = os.path.abspath(ENTITLEMENTS_CSV)
+    # In a container the path is only reachable through a mounted volume, so the
+    # setup instructions have to say which one.
+    volume = ""
+    if IN_CONTAINER:
+        for mount in ("/data",):
+            if path == mount or path.startswith(mount + os.sep):
+                volume = mount
+                break
+    return {
+        "available": bool(entries),
+        "count": len(entries),
+        "path": path,
+        "volume": volume,
+        "in_container": IN_CONTAINER,
+        "source_url": ENTITLEMENTS_SOURCE_URL,
+    }
+
+
+@app.get("/api/cloud/status")
+def api_cloud_status() -> JSONResponse:
+    """Whether an entitlement catalogue is loaded, and where it is expected."""
+    return JSONResponse(_cloud_status())
+
+
+@app.post("/api/cloud/reload")
+def api_cloud_reload() -> JSONResponse:
+    """Re-read the catalogue, picking up a file added since startup."""
+    state.reload_entitlements()
+    return JSONResponse(_cloud_status())
+
+
+@app.post("/api/cloud/upload")
+async def api_cloud_upload(request: Request) -> JSONResponse:
+    """Write a catalogue CSV sent as the request body, then load it.
+
+    The destination is always ENTITLEMENTS_CSV, never anything the caller names.
+    The body is validated as an entitlement CSV before it replaces an existing
+    catalogue, and is swapped in by rename so a failure cannot leave a partial
+    file behind.
+    """
+    body = await request.body()
+    if not body:
+        return JSONResponse({"ok": False, "error": "empty upload"}, status_code=400)
+    if len(body) > ENTITLEMENTS_MAX_UPLOAD:
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": f"too large (limit {ENTITLEMENTS_MAX_UPLOAD // (1024 * 1024)} MB)",
+            },
+            status_code=413,
+        )
+    try:
+        text = body.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return JSONResponse({"ok": False, "error": "not UTF-8 text"}, status_code=400)
+
+    header = text.lstrip().split("\n", 1)[0].strip()
+    columns = {c.strip().lower() for c in header.split(",")}
+    missing = {"entitlement_id", "package_url"} - columns
+    if missing:
+        return JSONResponse(
+            {"ok": False, "error": f"missing column(s): {', '.join(sorted(missing))}"},
+            status_code=400,
+        )
+    # Parsed up front so an unusable file is rejected before it can replace a
+    # working catalogue.
+    parsed = entitlements.load_text(text)
+    if not parsed:
+        return JSONResponse(
+            {"ok": False, "error": "no usable rows in that CSV"}, status_code=400
+        )
+
+    path = os.path.abspath(ENTITLEMENTS_CSV)
+    tmp = path + ".part"
+    try:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(tmp, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except OSError as e:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+    state.reload_entitlements()
+    return JSONResponse({"ok": True, **_cloud_status()})
+
+
+@app.get("/api/cloud/search")
+def api_cloud_search(q: str = "", limit: int = 40, platform: str = "") -> JSONResponse:
+    """Search the entitlement catalogue by title, title id or entitlement id.
+
+    ``platform`` optionally restricts results to one of ps4 / ps5.
+    """
+    entries = state.entitlements
+    if not entries:
+        return JSONResponse(
+            {"ok": False, "error": f"no catalogue at {ENTITLEMENTS_CSV}", "results": []},
+            status_code=503,
+        )
+    platform = platform.strip().lower()
+    if platform and platform not in ("ps4", "ps5"):
+        return JSONResponse(
+            {"ok": False, "error": f"unknown platform {platform!r}", "results": []},
+            status_code=400,
+        )
+    hits = entitlements.search(
+        entries, q, limit=max(1, min(limit, 200)), platform=platform
+    )
+    return JSONResponse({"ok": True, "total": len(hits), "results": [h.to_dict() for h in hits]})
+
+
+class CloudResolveRequest(BaseModel):
+    entitlement_id: str = ""
+    url: str = ""
+
+
+@app.post("/api/cloud/resolve")
+def api_cloud_resolve(req: CloudResolveRequest) -> JSONResponse:
+    """List the installable targets behind a catalogue row or a bare URL.
+
+    A ``.json`` or ``.pkg`` target yields one; a ``.xml`` target is fetched and
+    may yield several (the app plus its additional content) to pick from.
+    """
+    if req.url.strip():
+        url = req.url.strip()
+        if not url.lower().startswith(("http://", "https://")):
+            return JSONResponse({"ok": False, "error": "url must be http(s)"}, status_code=400)
+        entry = entitlements.from_url(url)
+        if not entry.url_kind:
+            return JSONResponse(
+                {"ok": False, "error": "url must end in .pkg, .json or .xml"},
+                status_code=400,
+            )
+    else:
+        entry = entitlements.find(state.entitlements, req.entitlement_id)
+    if entry is None:
+        return JSONResponse({"ok": False, "error": "unknown entitlement"}, status_code=404)
+    try:
+        packages = entitlements.resolve(entry)
+    except OSError as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=502)
+    except ElementTree.ParseError as e:
+        return JSONResponse({"ok": False, "error": f"bad version.xml: {e}"}, status_code=502)
+    if not packages:
+        return JSONResponse({"ok": False, "error": "no installable manifest"}, status_code=404)
+    return JSONResponse(
+        {
+            "ok": True,
+            "title": entry.title,
+            "url_kind": entry.url_kind,
+            "packages": [p.to_dict() for p in packages],
+        }
+    )
+
+
+class CloudPushRequest(BaseModel):
+    console_ip: str
+    console_port: int
+    manifest_url: str
+    content_id: str = ""
+    name: str = ""
+    protocol: str = "ezremote"
+
+
+@app.post("/api/cloud/push")
+def api_cloud_push(req: CloudPushRequest) -> JSONResponse:
+    """Hand a console a Sony manifest URL to install from.
+
+    Unlike ``/api/push`` the console downloads straight from Sony, so no local
+    package or download URL is involved.
+    """
+    protocol = (req.protocol or "ezremote").lower()
+    if protocol not in PUSH_PROTOCOLS:
+        return JSONResponse(
+            {"ok": False, "error": f"unknown protocol {protocol!r}"}, status_code=400
+        )
+    url = req.manifest_url.strip()
+    if not url.lower().startswith(("http://", "https://")):
+        return JSONResponse({"ok": False, "error": "manifest_url must be http(s)"}, status_code=400)
+
+    name = req.name or req.content_id or url.rsplit("/", 1)[-1]
+    try:
+        if protocol == "ezremote":
+            result = _push_ezremote(req.console_ip, req.console_port, url)
+        elif protocol == "remote_pkg":
+            result = _push_remote_pkg(req.console_ip, req.console_port, url)
+        else:
+            fields = {
+                "url": url,
+                "content_id": req.content_id,
+                "content_name": name,
+                "icon_url": "",
+            }
+            if protocol == "etahen_v2":
+                result = _push_etahen_v2(req.console_ip, req.console_port, fields)
+            else:
+                result = _push_etahen_v1(req.console_ip, req.console_port, fields)
+    except OSError as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=502)
+    except urllib.error.URLError as e:
+        return JSONResponse({"ok": False, "error": str(e.reason)}, status_code=502)
+
+    return JSONResponse({"ok": True, "protocol": protocol, "url": url, **result})
 
 
 def _server_authority(

@@ -14,6 +14,8 @@ test-pkg/
 # Local scratch scripts (single leading underscore only; never dunder files)
 _[!_]*.py
 
+entitlements*.csv
+
 # Local config
 .env
 *.pkg

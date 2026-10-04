@@ -4,6 +4,7 @@ FROM python:3.14-slim
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     ICON_DIR=/data/icons \
+    ENTITLEMENTS_CSV=/data/entitlements_all.csv \
     SCAN_WORKERS=8
 
 WORKDIR /app

@@ -8,6 +8,7 @@ services:
       # Colon-separated directories to scan (inside the container).
       PKG_DIRS: "/ps4:/ps5"
       ICON_DIR: "/data/icons"
+      ENTITLEMENTS_CSV: "/data/entitlements_all.csv"
       SCAN_WORKERS: 8
       # host:port the console downloads from. REQUIRED with bridge networking
       # (below) since the app cannot auto-detect the reachable address.
@@ -16,7 +17,7 @@ services:
     volumes:
       - "/mnt/user/games/ps4:/ps4:ro"
       - "/mnt/user/games/ps5:/ps5:ro"
-      # Persistent icon cache.
+      # Persistent cache.
       - "/mnt/user/appdata/ps-pkg-server:/data"
 
     restart: unless-stopped
