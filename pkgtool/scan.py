@@ -382,50 +382,71 @@ def _pair_ps5_splits(paths: List[str]):
     the same-directory, same-PFS-image-size main with the best ``_content_id_affinity``.
     Unmatched mains/SCs are returned in ``remaining_paths``.
     """
-    mains = []  # (path, dir, pfs_image_size, content_id)
+    mains = []  # (parts, dir, pfs_image_size, content_id)
     scs = []    # (path, dir, pfs_image_size, content_id)
+    num_sets: Dict[tuple, Dict[int, str]] = {}
+    sc_stems = set()
     for p in paths:
-        kind, _stem, _idx = _classify_piece(p)
+        kind, stem, idx = _classify_piece(p)
+        key = (os.path.dirname(p), stem)
         if kind == "num":
-            continue  # numbered chunk: leave to filename grouping
+            num_sets.setdefault(key, {})[idx] = p
+            continue
+        if kind == "sc":
+            sc_stems.add(key)
         # Only *_sc.pkg files can be SC tails; anything else that is a bare CNT is
         # a standalone package, not a split companion.
         if kind != "sc" and not _is_headless_main_candidate(p):
             continue
-        try:
-            with FileSource(p) as fs:
-                probe = probe_split_header(fs, os.path.getsize(p))
-        except OSError:
-            probe = None
+        probe = _probe(p, os.path.getsize(p))
         if probe is None:
             continue
         d = os.path.dirname(p)
         if probe.kind == "headless_main":
             # A headless main has no readable content id; use its filename stem.
-            mains.append((p, d, probe.pfs_image_size, _content_id_from_filename(p)))
+            mains.append(([p], d, probe.pfs_image_size, _content_id_from_filename(p)))
         elif probe.kind == "sc" and kind == "sc":
             scs.append((p, d, probe.pfs_image_size, probe.content_id))
+
+    for (d, stem), chunks in num_sets.items():
+        if (d, stem) in sc_stems:
+            continue  # same-stem SC: filename grouping already pairs these
+        ordered = [chunks[i] for i in sorted(chunks)]
+        # The container header lives in the first chunk, but whether the embedded
+        # CNT is present depends on the size of the whole set.
+        probe = _probe(ordered[0], sum(os.path.getsize(c) for c in ordered))
+        if probe is not None and probe.kind == "headless_main":
+            mains.append((ordered, d, probe.pfs_image_size, _content_id_from_filename(ordered[0])))
 
     sources: List[dict] = []
     consumed = set()
     for sc_path, sc_dir, sc_pfs, sc_cid in scs:
         candidates = [
-            (mp, mcid) for mp, md, mp_pfs, mcid in mains
+            (mparts, mcid) for mparts, md, mp_pfs, mcid in mains
             if md == sc_dir and mp_pfs == sc_pfs
         ]
         if not candidates:
             continue  # no same-dir, same-size main -> not a completable split
-        main_path, _mcid = max(candidates, key=lambda c: _content_id_affinity(sc_cid, c[1]))
+        main_parts, _mcid = max(candidates, key=lambda c: _content_id_affinity(sc_cid, c[1]))
         # SC-driven identity: name the package after the SC (its region/content id).
         name = os.path.basename(sc_path)
         if name.lower().endswith("_sc.pkg"):
             name = name[: -len("_sc.pkg")] + ".pkg"
-        sources.append({"name": name, "parts": [main_path, sc_path], "split": True})
+        sources.append({"name": name, "parts": main_parts + [sc_path], "split": True})
         consumed.add(sc_path)
-        consumed.add(main_path)
+        consumed.update(main_parts)
 
     remaining = [p for p in paths if p not in consumed]
     return sources, remaining
+
+
+def _probe(path: str, total_size: int):
+    """probe_split_header for a file on disk, or None if it can't be read."""
+    try:
+        with FileSource(path) as fs:
+            return probe_split_header(fs, total_size)
+    except OSError:
+        return None
 
 
 def _is_headless_main_candidate(path: str) -> bool:

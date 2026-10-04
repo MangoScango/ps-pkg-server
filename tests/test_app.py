@@ -917,6 +917,56 @@ def test_group_sources_orphan_sc_and_main_left_alone():
         }
 
 
+def test_group_sources_numbered_split_with_divergent_sc_name():
+    """A numbered chunk set whose SC carries a different content id is paired
+    structurally, in chunk order, with the SC last."""
+    from pkgtool.scan import group_sources, find_pkgs
+
+    with tempfile.TemporaryDirectory() as root:
+        _write_headless_main(root, "JP0005-PPSA03805_00-P5RGAME000000000.pkg",
+                             pfs_image_size=0x300000)
+        # Cut the main into numbered chunks, as a download splits it.
+        whole = os.path.join(root, "JP0005-PPSA03805_00-P5RGAME000000000.pkg")
+        data = open(whole, "rb").read()
+        os.remove(whole)
+        step = len(data) // 3 + 1
+        for i in range(3):
+            with open(os.path.join(root, f"JP0005-PPSA03805_00-P5RGAME000000000_{i}.pkg"), "wb") as f:
+                f.write(data[i * step:(i + 1) * step])
+        _write_sc(root, "UP0177-PPSA05109_00-P5RGAME000000000_sc.pkg",
+                  content_id="UP0177-PPSA05109_00-P5RGAME000000000", title="P5R",
+                  pfs_image_size=0x300000)
+
+        sources = group_sources(find_pkgs([root]))
+        assert len(sources) == 1
+        s = sources[0]
+        assert s["split"] is True
+        assert [os.path.basename(p) for p in s["parts"]] == [
+            "JP0005-PPSA03805_00-P5RGAME000000000_0.pkg",
+            "JP0005-PPSA03805_00-P5RGAME000000000_1.pkg",
+            "JP0005-PPSA03805_00-P5RGAME000000000_2.pkg",
+            "UP0177-PPSA05109_00-P5RGAME000000000_sc.pkg",
+        ]
+
+
+def test_group_sources_numbered_split_same_stem_sc():
+    """A same-stem SC keeps its filename-based pairing."""
+    from pkgtool.scan import group_sources, find_pkgs
+
+    with tempfile.TemporaryDirectory() as root:
+        for i in range(2):
+            with open(os.path.join(root, f"GAME-CUSA1_{i}.pkg"), "wb") as f:
+                f.write(b"\x00" * 64)
+        with open(os.path.join(root, "GAME-CUSA1_sc.pkg"), "wb") as f:
+            f.write(b"\x00" * 64)
+
+        sources = group_sources(find_pkgs([root]))
+        assert len(sources) == 1
+        assert [os.path.basename(p) for p in sources[0]["parts"]] == [
+            "GAME-CUSA1_0.pkg", "GAME-CUSA1_1.pkg", "GAME-CUSA1_sc.pkg",
+        ]
+
+
 def test_group_sources_standalone_cnt_not_paired_as_sc():
     """A bare-CNT package NOT named ``_sc.pkg`` (e.g. a -MERGED standalone) is
     never treated as an SC tail, even when a same-size headless main is present.
