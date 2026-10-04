@@ -325,6 +325,7 @@ class Pkg:
     entry_table_offset: int
     pfs_image_offset: int
     cnt_base: int = 0  # embedded-CNT offset (0 for a bare CNT / PS4)
+    container: str = "CNT"  # "CNT", "FIH" or "LIH"
     edition: str = ""  # Retail / Debug / fpkg
     digests_base: int = 0  # absolute offset of the DIGESTS table (entry index 0)
     package_size: int = 0  # declared total package size (header 0x430)
@@ -395,7 +396,7 @@ class Pkg:
     def kind(self) -> str:
         """High-level package kind: Game / Update / DLC / App / Other."""
         if self.platform == "PS5":
-            return classify_kind_ps5(self.content_flags, self.content_type)
+            return classify_kind_ps5(self.content_flags, self.content_type, self.container)
         # PS4: base vs update needs the SFO CATEGORY (gd* vs gp*); both share
         # content_type GD. content_type is a fallback when CATEGORY is missing.
         return classify_kind(self.category, self.content_type)
@@ -418,7 +419,13 @@ class Pkg:
     def is_metadata_fragment(self, available_size: int) -> bool:
         """True if this is a metadata-only tail (an SC segment) rather than a
         full package: the CNT declares a package far larger than the bytes we
-        actually have (a real full package has package_size ~= its size)."""
+        actually have (a real full package has package_size ~= its size).
+
+        Only a bare CNT can be such a tail: an LIH declares the size of the
+        finalized package it builds into, well beyond its own.
+        """
+        if self.cnt_base != 0:
+            return False
         return self.package_size > available_size * 2
 
     def has_icon0(self) -> bool:
@@ -538,12 +545,13 @@ def _u64le(b: bytes, off: int) -> int:
 
 
 def _locate_cnt(source: ByteSource):
-    """Return (cnt_base, fih_signed_byte) for the \\x7FCNT container.
+    """Return (cnt_base, fih_signed_byte, container) for the \\x7FCNT container.
 
     PS4 packages and bare PS5 CNT containers start with the magic at 0. PS5
-    installable packages are \\x7FFIH (or intermediate \\x7FLIH) images that wrap
-    the CNT at an embedded offset stored in their little-endian header. The FIH
-    signed byte (0x05) is returned for retail/debug detection (None otherwise).
+    installable packages are \\x7FFIH (or \\x7FLIH) images that wrap the CNT at an
+    embedded offset stored in their little-endian header. The FIH signed byte
+    (0x05) is returned for retail/debug detection (None otherwise), and
+    ``container`` is "CNT", "FIH" or "LIH".
     """
     head = source.read(0, 0x60)
     magic = head[0:4]
@@ -551,21 +559,21 @@ def _locate_cnt(source: ByteSource):
         # Bare \x7FCNT: PS4 package or a bare PS5 CNT. The 0x06 field is part of
         # the big-endian header flags here (not a FIH format version), so we do
         # not version-check it -- the CNT magic path is shared by PS4 and PS5.
-        return 0, None
+        return 0, None, "CNT"
     if magic == FIH_MAGIC:
         version = struct.unpack_from("<H", head, _FIH_FORMAT_VERSION)[0]
         if version != _FIH_REQUIRED_VERSION:
             raise PkgError(
                 f"unsupported FIH format version {version} (expected {_FIH_REQUIRED_VERSION})"
             )
-        return _u64le(head, _FIH_EMBEDDED_CNT_OFFSET), head[_FIH_SIGNED_BYTE]
+        return _u64le(head, _FIH_EMBEDDED_CNT_OFFSET), head[_FIH_SIGNED_BYTE], "FIH"
     if magic == LIH_MAGIC:
         version = struct.unpack_from("<H", head, _FIH_FORMAT_VERSION)[0]
         if version != _LIH_REQUIRED_VERSION:
             raise PkgError(
                 f"unsupported LIH format version {version} (expected {_LIH_REQUIRED_VERSION})"
             )
-        return _u64le(head, _LIH_EMBEDDED_CNT_OFFSET), None
+        return _u64le(head, _LIH_EMBEDDED_CNT_OFFSET), None, "LIH"
     raise PkgError("not a PS4/PS5 PKG (bad magic)")
 
 
@@ -666,7 +674,7 @@ def probe_split_header(source: ByteSource, total_size: int) -> Optional[SplitHea
 
 
 def _parse(source: ByteSource) -> Pkg:
-    cnt_base, fih_signed = _locate_cnt(source)
+    cnt_base, fih_signed, container = _locate_cnt(source)
 
     # A non-retail FIH image (signed byte 0x00) is an fpkg when its outer PFS
     # superblock carries the PLAINTEXT_NOAUTH seed marker, otherwise a stock debug
@@ -729,6 +737,7 @@ def _parse(source: ByteSource) -> Pkg:
         entry_table_offset=entry_table_offset,
         pfs_image_offset=pfs_image_offset,
         cnt_base=cnt_base,
+        container=container,
         edition=detect_edition(fih_signed, header_flags, is_plaintext_noauth),
         digests_base=digests_base,
         package_size=package_size,
@@ -952,8 +961,11 @@ def classify_kind(category: Optional[str], content_type: int) -> str:
     return "Other"
 
 
-def classify_kind_ps5(content_flags: int, content_type: int) -> str:
+def classify_kind_ps5(content_flags: int, content_type: int, container: str = "FIH") -> str:
     """Classify a PS5 package as Update / DLC / App / Game.
+
+    An LIH container is a patch: it is built against a reference base package and
+    carries only the changed data.
 
     On PS5, ``content_type`` is the reliable base/DLC/patch signal -- it mirrors
     the PS4 convention (0x20 GD / 0x21 AC / 0x22 AL / 0x23 DP), and this matches
@@ -969,13 +981,13 @@ def classify_kind_ps5(content_flags: int, content_type: int) -> str:
 
     - ``content_type == 0x21`` (AC, data DLC) or ``0x22`` (AL, entitlement-only)
       -> DLC / additional content.
-    - ``content_type == 0x23`` or the DELTA_PATCH flag pattern -> Update. PS5
-      full images are cumulative -- a "subsequent" or "cumulative" full image
-      (Astro's Playroom shipping at 01.905.000, Balatro, etc.) is a complete,
-      self-contained installable game, not a separate update.
+    - An LIH container, ``content_type == 0x23``, or the DELTA_PATCH flag pattern
+      -> Update. A FIH/CNT full image is cumulative and self-contained -> Game.
     - NON_GAME (0x04000000) -> App (non-game application).
     - Everything else -> Game.
     """
+    if container == "LIH":
+        return "Update"
     # Delta patch: either the content_type (0x23) or the DELTA_PATCH flag
     # combination (SUBSEQUENT|FIRST = 0x41000000). Retail deltas set both.
     if content_type == 0x23 or (content_flags & _FLAG_DELTA_PATCH) == _FLAG_DELTA_PATCH:

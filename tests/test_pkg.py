@@ -237,6 +237,24 @@ def _build_sblock(plaintext_noauth=False):
     return bytes(sb)
 
 
+def build_ps5_lih_pkg(param_obj, content_id="UP9000-PPSA06795_00-NPUG801350000000",
+                      content_flags=0x4A420000, content_type=0x20):
+    """Build a PS5 \\x7FLIH image wrapping a CNT.
+
+    Format version sits at 0x06 and the embedded-CNT offset at 0x30, both LE.
+    """
+    import json
+
+    cnt = build_cnt([(0x2000, json.dumps(param_obj).encode("utf-8"))], content_id,
+                    content_type=content_type, content_flags=content_flags)
+    cnt_base = 0x10000
+    lih = bytearray(b"\x00" * cnt_base)
+    lih[0:4] = b"\x7fLIH"
+    struct.pack_into("<H", lih, 0x06, 1)
+    struct.pack_into("<Q", lih, 0x30, cnt_base)
+    return bytes(lih) + cnt
+
+
 def build_ps5_pkg(param_obj, icon0=b"", content_id="UP4433-PPSA19639_00-CPREVIEW00000000",
                   content_flags=0, signed=0x80, content_type=0x20, plaintext_noauth=False):
     """Build a PS5 \\x7FFIH image wrapping a CNT with param.json (0x2000).
@@ -618,6 +636,30 @@ def test_min_ps5_fw():
              "localizedParameters": {"defaultLanguage": "en", "en": {"titleName": "X"}}}
     with Pkg.from_source(BytesSource(build_ps5_pkg(param))) as pkg:
         assert pkg.min_ps5_fw == "8.40" == pkg.min_sdk
+
+
+def test_ps5_lih_is_patch():
+    param = {"titleId": "PPSA06795", "contentVersion": "01.001.000",
+             "originContentVersion": "01.000.005",
+             "localizedParameters": {"defaultLanguage": "en", "en": {"titleName": "echochrome"}}}
+    with Pkg.from_source(BytesSource(build_ps5_lih_pkg(param))) as pkg:
+        assert pkg.platform == "PS5"
+        assert pkg.container == "LIH"
+        assert pkg.kind == "Update"
+        assert pkg.version == "01.001.000"
+        assert pkg.is_delta_patch is False
+
+
+def test_classify_kind_ps5_container():
+    from pkgtool.pkg import classify_kind_ps5
+
+    # Identical flags and content_type, split only by the container.
+    assert classify_kind_ps5(0x4A420000, 0x20, "FIH") == "Game"
+    assert classify_kind_ps5(0x4A420000, 0x20, "LIH") == "Update"
+    assert classify_kind_ps5(0x46420000, 0x26, "CNT") == "App"
+    # The container outranks the DLC content types.
+    assert classify_kind_ps5(0x02020000, 0x21, "LIH") == "Update"
+    assert classify_kind_ps5(0x02020000, 0x21, "FIH") == "DLC"
 
 
 def test_probe_split_header_classification():
