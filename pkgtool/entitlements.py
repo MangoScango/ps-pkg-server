@@ -11,10 +11,12 @@ from __future__ import annotations
 import csv
 import io
 import os
+import re
 import ssl
 import urllib.request
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional
+from urllib.parse import SplitResult, urlsplit, urlunsplit
 from xml.etree import ElementTree
 
 
@@ -53,6 +55,9 @@ class CloudPackage:
     content_ver: str
     manifest_url: str
     name: str = ""
+    title: str = ""
+    title_id: str = ""
+    platform: str = ""
 
     def to_dict(self) -> Dict[str, object]:
         return asdict(self)
@@ -125,6 +130,47 @@ def search(
         scored.append(((0, pos) if pos >= 0 else (1, 0), len(e.title), e))
     scored.sort(key=lambda s: (s[0], s[1], s[2].title.lower(), s[2].entitlement_id))
     return [e for _rank, _len, e in scored[:limit]]
+
+
+_NUMBERED_PIECE = re.compile(r"^(.+)_\d+\.pkg$", re.IGNORECASE)
+_SC_PIECE = re.compile(r"^(.+)_sc\.pkg$", re.IGNORECASE)
+
+
+def _is_ps4_cdn(parts: SplitResult) -> bool:
+    host = (parts.hostname or "").lower()
+    return host.startswith("gs2.") and parts.path.startswith("/gs2/")
+
+
+def _is_ps5_cdn(parts: SplitResult) -> bool:
+    host = (parts.hostname or "").lower()
+    return host.startswith("sgst.") and parts.path.startswith("/sgst/")
+
+
+def manifest_url_for(url: str) -> str:
+    """Derive the .json manifest URL for one piece of a split package.
+
+    Returns ``url`` unchanged when no manifest can be derived from it.
+
+    PS5 signs the numbered pieces' directory (``/app/pkg/``) separately from the
+    manifest's (``/app/info/``), so only its ``_sc`` piece, which sits beside the
+    manifest, can be mapped; PS4 keeps both in one directory. Either suffix is
+    also an ordinary local filename, hence the check against the known CDNs.
+    """
+    url = url.strip()
+    parts = urlsplit(url)
+    head, slash, filename = parts.path.rpartition("/")
+    if not slash or not filename:
+        return url
+    match = _SC_PIECE.match(filename)
+    if match is not None:
+        if not _is_ps5_cdn(parts):
+            return url
+    else:
+        match = _NUMBERED_PIECE.match(filename)
+        if match is None or not _is_ps4_cdn(parts):
+            return url
+    path = f"{head}/{match.group(1)}.json"
+    return urlunsplit((parts.scheme, parts.netloc, path, parts.query, parts.fragment))
 
 
 def from_url(url: str) -> Entitlement:
@@ -205,11 +251,22 @@ def resolve(entry: Entitlement) -> List[CloudPackage]:
                 content_ver="",
                 manifest_url=entry.package_url,
                 name=entry.title,
+                title=entry.title,
+                title_id=entry.title_id,
+                platform=entry.platform,
             )
         ]
     if entry.url_kind == "xml":
         packages = parse_version_xml(fetch(entry.package_url))
         for p in packages:
+            # A document yields the app plus its update and additional content
+            # under one title; qualify all but the base game to tell them apart.
+            qualifier = " ".join(x for x in (p.kind, p.content_ver) if x)
+            p.title = entry.title
             p.name = entry.title
+            if p.kind != "Game" and qualifier:
+                p.name = f"{entry.title} ({qualifier})"
+            p.title_id = entry.title_id
+            p.platform = entry.platform
         return packages
     return []

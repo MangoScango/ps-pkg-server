@@ -1204,6 +1204,136 @@ def test_cloud_push_rejects_bad_input():
             assert r.status_code == 400
 
 
+def _capture_pushes(app_module):
+    """Replace the console push helpers with recorders. Returns the call log."""
+    calls = []
+    ok = {"response": "0", "code": 0, "code_hex": "0x0"}
+
+    def ez(ip, port, url):
+        calls.append(("ezremote", url))
+        return ok
+
+    def etahen(ip, port, fields):
+        calls.append(("etahen", dict(fields)))
+        return ok
+
+    def remote(ip, port, url):
+        calls.append(("remote_pkg", url))
+        return ok
+
+    app_module._push_ezremote = ez
+    app_module._push_etahen_v1 = etahen
+    app_module._push_etahen_v2 = etahen
+    app_module._push_remote_pkg = remote
+    return calls
+
+
+def test_cloud_push_passes_catalogue_metadata_to_etahen():
+    """etaHEN gets the catalogue title and content id in its own fields."""
+    with tempfile.TemporaryDirectory() as root:
+        app_module, client = _cloud_client(root)
+        calls = _capture_pushes(app_module)
+        with client:
+            j = client.post(
+                "/api/cloud/resolve",
+                json={"entitlement_id": "UP0700-CUSA28863_00-ELDENRING0000000"},
+            ).json()
+            pkg = j["packages"][0]
+            assert pkg["title"] == "ELDEN RING PS4"
+            assert pkg["title_id"] == "CUSA28863"
+            assert pkg["platform"] == "ps4"
+
+            for protocol in ("etahen_v1", "etahen_v2"):
+                del calls[:]
+                r = client.post(
+                    "/api/cloud/push",
+                    json={
+                        "console_ip": "127.0.0.1",
+                        "console_port": 9090,
+                        "protocol": protocol,
+                        "manifest_url": pkg["manifest_url"],
+                        "content_id": pkg["content_id"],
+                        "name": pkg["name"],
+                        "title": pkg["title"],
+                    },
+                )
+                assert r.json()["ok"] is True
+                kind, fields = calls[0]
+                assert kind == "etahen"
+                assert fields["url"] == pkg["manifest_url"]
+                assert fields["content_id"] == "UP0700-CUSA28863_00-ELDENRING0000000"
+                assert fields["content_name"] == "ELDEN RING PS4"
+                assert fields["icon_url"] == ""
+
+
+def test_cloud_push_leaves_the_cdn_url_undecorated():
+    """No query string is appended to a signed Sony URL for any protocol."""
+    url = "http://gs2.example/UP0700-CUSA28863_00-ELDENRING0000000.json"
+    with tempfile.TemporaryDirectory() as root:
+        app_module, client = _cloud_client(root)
+        calls = _capture_pushes(app_module)
+        with client:
+            for protocol in ("ezremote", "remote_pkg"):
+                del calls[:]
+                r = client.post(
+                    "/api/cloud/push",
+                    json={
+                        "console_ip": "127.0.0.1",
+                        "console_port": 9090,
+                        "protocol": protocol,
+                        "manifest_url": url,
+                        "content_id": "UP0700-CUSA28863_00-ELDENRING0000000",
+                        "title": "ELDEN RING PS4",
+                    },
+                )
+                assert r.json()["ok"] is True
+                assert calls[0] == (protocol, url)
+
+
+def test_cloud_push_swaps_a_split_piece_for_its_manifest():
+    """A pasted PS4 piece URL installs from the manifest beside it; a PS5
+    numbered piece has no derivable manifest and goes through untouched."""
+    piece = (
+        "http://gs2.ww.prod.dl.playstation.net/gs2/ppkgo/prod/CUSA03041_00/48/"
+        "f_756e60f4ca0dd7575e21603b66f1d0b49885bf551ba36913e7ad17355b12a8d2/f/"
+        "UP1004-CUSA03041_00-REDEMPTION000002-A0132-V0100_2.pkg"
+    )
+    manifest = piece.replace("_2.pkg", ".json")
+    ps5_piece = (
+        "http://gst.prod.dl.playstation.net/gst/prod/00/PPSA30449_00/app/pkg/24/"
+        "f_f509835c1f6b63c73607d0f09dd40afcc0666aae07ba827fafb75f7a65e96733/"
+        "EP4638-PPSA30449_00-XXXXXXXXXXXXXXXX_4.pkg"
+    )
+    with tempfile.TemporaryDirectory() as root:
+        app_module, client = _cloud_client(root)
+        calls = _capture_pushes(app_module)
+        with client:
+            # Resolution hands the piece on untouched; the swap belongs to the
+            # push, which is the only step that knows the protocol.
+            j = client.post("/api/cloud/resolve", json={"url": piece}).json()
+            assert j["ok"] is True and j["url_kind"] == "pkg"
+            resolved = j["packages"][0]["manifest_url"]
+            assert resolved == piece
+
+            base = {"console_ip": "127.0.0.1", "console_port": 9090}
+            r = client.post("/api/cloud/push", json={**base, "manifest_url": resolved})
+            assert r.json()["url"] == manifest
+            assert calls[-1] == ("ezremote", manifest)
+
+            r = client.post("/api/cloud/push", json={**base, "manifest_url": ps5_piece})
+            assert r.json()["url"] == ps5_piece
+            assert calls[-1] == ("ezremote", ps5_piece)
+
+            # remote_pkg installs from a pkg header, so it keeps the piece URL
+            # even when the browser reached the endpoint the same way.
+            r = client.post(
+                "/api/cloud/push",
+                json={**base, "protocol": "remote_pkg", "manifest_url": resolved},
+            )
+            assert r.json()["url"] == piece
+            assert calls[-1] == ("remote_pkg", piece)
+
+
 def test_group_sources_numbered_split_with_divergent_sc_name():
     """A numbered chunk set whose SC carries a different content id is paired
     structurally, in chunk order, with the SC last."""

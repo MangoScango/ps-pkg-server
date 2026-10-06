@@ -657,11 +657,14 @@ function cloudRow(onClick, name, sub) {{
 function cloudUrlOption(url) {{
   const body = cloudBodyEl();
   body.innerHTML = '';
-  const m = url.split('?')[0].split('#')[0].match(/\\.(pkg|json|xml)$/i);
+  const path = url.split('?')[0].split('#')[0];
+  const m = path.match(/\\.(pkg|json|xml)$/i);
   if (!m) {{ cloudNote('A URL must end in .pkg, .json or .xml to install from it.'); return; }}
   const kind = m[1].toLowerCase();
+  // A piece of a split package may install from the manifest beside it, so the
+  // label stays neutral about what ends up being fetched.
   const label = {{
-    pkg: 'Install this .pkg directly',
+    pkg: /_(\\d+|sc)\\.pkg$/i.test(path) ? 'Install this package' : 'Install this .pkg directly',
     json: 'Install from this manifest',
     xml: 'Install from this version.xml',
   }}[kind];
@@ -724,15 +727,16 @@ async function cloudResolve(payload) {{
   for (const p of j.packages) {{
     body.append(cloudRow(
       () => cloudPush(p),
-      [p.kind, j.title].filter(Boolean).join(' \u00b7 '),
-      [p.content_id, p.content_ver && 'v' + p.content_ver].filter(Boolean).join(' \u00b7 ')
+      [p.kind, p.title || j.title].filter(Boolean).join(' \u00b7 '),
+      [p.platform && p.platform.toUpperCase(), p.content_id,
+       p.content_ver && 'v' + p.content_ver].filter(Boolean).join(' \u00b7 ')
     ));
   }}
 }}
 
 async function cloudPush(pkg) {{
   const c = getConsole(); if (!c) return;
-  cloudNote('Installing ' + (pkg.content_id || pkg.name) + '\u2026');
+  cloudNote('Installing ' + (pkg.title || pkg.name || pkg.content_id) + '\u2026');
   let j;
   try {{
     const r = await fetch('/api/cloud/push', {{
@@ -740,7 +744,8 @@ async function cloudPush(pkg) {{
       headers: {{ 'Content-Type': 'application/json' }},
       body: JSON.stringify({{
         console_ip: c.ip, console_port: c.port, protocol: c.proto,
-        manifest_url: pkg.manifest_url, content_id: pkg.content_id, name: pkg.name || ''
+        manifest_url: pkg.manifest_url, content_id: pkg.content_id,
+        name: pkg.name || '', title: pkg.title || ''
       }})
     }});
     j = await r.json();
@@ -1222,6 +1227,7 @@ class CloudPushRequest(BaseModel):
     manifest_url: str
     content_id: str = ""
     name: str = ""
+    title: str = ""
     protocol: str = "ezremote"
 
 
@@ -1240,10 +1246,18 @@ def api_cloud_push(req: CloudPushRequest) -> JSONResponse:
     url = req.manifest_url.strip()
     if not url.lower().startswith(("http://", "https://")):
         return JSONResponse({"ok": False, "error": "manifest_url must be http(s)"}, status_code=400)
+    # A lone piece of a split package installs nothing, so it is traded for the
+    # manifest beside it. remote_pkg is the exception: its installer range-reads
+    # a pkg header off the URL, which a manifest cannot answer.
+    if protocol != "remote_pkg":
+        url = entitlements.manifest_url_for(url)
 
-    name = req.name or req.content_id or url.rsplit("/", 1)[-1]
+    name = req.name or req.title or req.content_id or url.rsplit("/", 1)[-1]
     try:
         if protocol == "ezremote":
+            # ezremote-dpi takes metadata only as a query string on the URL it is
+            # handed, and Sony's CDN paths are hash-signed; a display name is not
+            # worth risking the download for. etaHEN has its own fields below.
             result = _push_ezremote(req.console_ip, req.console_port, url)
         elif protocol == "remote_pkg":
             result = _push_remote_pkg(req.console_ip, req.console_port, url)

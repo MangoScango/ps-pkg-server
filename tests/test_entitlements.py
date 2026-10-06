@@ -126,8 +126,13 @@ def test_resolve_xml_row_parses_fetched_document():
     finally:
         ent.fetch = original
     assert [p.kind for p in packages] == ["Game", "DLC"]
-    # The catalogue title is carried onto every resolved package.
-    assert {p.name for p in packages} == {"ELDEN RING™"}
+    assert {p.title for p in packages} == {"ELDEN RING™"}
+    # The base game is named plainly; the rest are qualified so a console does
+    # not announce two installs under one name.
+    assert [p.name for p in packages] == [
+        "ELDEN RING™",
+        "ELDEN RING™ (DLC 01.000.000)",
+    ]
 
 
 def test_from_url():
@@ -146,6 +151,106 @@ def test_resolve_pkg_url_needs_no_fetch():
     assert len(packages) == 1
     assert packages[0].manifest_url == row.package_url
     assert packages[0].name == "UP1234-PPSA00001_00-GAME.pkg"
+
+
+PS4_PIECE = (
+    "http://gs2.ww.prod.dl.playstation.net/gs2/ppkgo/prod/CUSA03041_00/48/"
+    "f_756e60f4ca0dd7575e21603b66f1d0b49885bf551ba36913e7ad17355b12a8d2/f/"
+    "UP1004-CUSA03041_00-REDEMPTION000002-A0132-V0100_2.pkg"
+)
+PS4_MANIFEST = PS4_PIECE.replace("_2.pkg", ".json")
+
+PS5_SC_PIECE = (
+    "https://sgst.prod.dl.playstation.net/sgst/prod/00/PPSA30449_00/app/info/30/"
+    "f_78f8eec01b995d21e04cd6a6fdf2ac89c728e4be6a9156cbd3f3247494bed85f/"
+    "EP4638-PPSA30449_00-XXXXXXXXXXXXXXXX_sc.pkg"
+)
+PS5_SC_MANIFEST = PS5_SC_PIECE.replace("_sc.pkg", ".json")
+
+PS5_NUMBERED_PIECE = (
+    "http://gst.prod.dl.playstation.net/gst/prod/00/PPSA30449_00/app/pkg/24/"
+    "f_f509835c1f6b63c73607d0f09dd40afcc0666aae07ba827fafb75f7a65e96733/"
+    "EP4638-PPSA30449_00-XXXXXXXXXXXXXXXX_4.pkg"
+)
+
+
+def test_manifest_url_for_ps4_numbered_piece():
+    assert ent.manifest_url_for(PS4_PIECE) == PS4_MANIFEST
+
+
+def test_manifest_url_for_ps5_sc_piece():
+    assert ent.manifest_url_for(PS5_SC_PIECE) == PS5_SC_MANIFEST
+
+
+def test_manifest_url_for_leaves_ps5_numbered_piece_alone():
+    # The manifest lives under a separately signed /app/info/ path.
+    assert ent.manifest_url_for(PS5_NUMBERED_PIECE) == PS5_NUMBERED_PIECE
+
+
+def test_manifest_url_for_is_idempotent():
+    for url in (PS4_PIECE, PS5_SC_PIECE, PS5_NUMBERED_PIECE):
+        once = ent.manifest_url_for(url)
+        assert ent.manifest_url_for(once) == once
+
+
+def test_manifest_url_for_leaves_other_urls_alone():
+    for url in (
+        PS4_MANIFEST,
+        "https://e/x/abc-version.xml",
+        "https://e/x/GAME.pkg",
+        "https://e/x/readme.txt",
+        # A piece off the CDN it was named for is not known to sit beside a
+        # manifest; both suffixes are also ordinary local filenames.
+        "https://example.com/x/UP1004-CUSA03041_00-GAME_2.pkg",
+        "https://gs2.ww.prod.dl.playstation.net/elsewhere/GAME_2.pkg",
+        "http://myserver/pkg/EP4638-PPSA30449_00-XXXXXXXXXXXXXXXX_sc.pkg",
+        "https://sgst.prod.dl.playstation.net/elsewhere/GAME_sc.pkg",
+        "notaurl",
+        "",
+    ):
+        assert ent.manifest_url_for(url) == url
+
+
+def test_manifest_url_for_preserves_query_and_fragment():
+    assert ent.manifest_url_for(PS4_PIECE + "?t=1#f") == PS4_MANIFEST + "?t=1#f"
+
+
+def test_resolution_carries_a_piece_url_through_untouched():
+    # Whether a piece is traded for its manifest depends on the push protocol,
+    # so resolution hands the URL on as it found it.
+    assert ent.from_url("  " + PS4_PIECE + "  ").package_url == PS4_PIECE
+    row = ent.Entitlement(
+        entitlement_id="UP1004-CUSA03041_00-REDEMPTION000002",
+        title="Red Dead Redemption 2",
+        title_id="CUSA03041",
+        package_url=PS4_PIECE,
+        platform="ps4",
+        content_type="game",
+    )
+    assert ent.resolve(row)[0].manifest_url == PS4_PIECE
+
+
+def test_resolve_carries_catalogue_identity():
+    rows = ent.load(_catalogue())
+    row = next(r for r in rows if r.url_kind == "json")
+    pkg = ent.resolve(row)[0]
+    assert pkg.title == row.title
+    assert pkg.title_id == row.title_id
+    assert pkg.platform == row.platform
+
+
+def test_resolve_xml_carries_catalogue_identity():
+    rows = ent.load(_catalogue())
+    row = next(r for r in rows if r.url_kind == "xml")
+    original = ent.fetch
+    ent.fetch = lambda url, timeout=20: VERSION_XML
+    try:
+        packages = ent.resolve(row)
+    finally:
+        ent.fetch = original
+    assert {p.title for p in packages} == {"ELDEN RING™"}
+    assert {p.platform for p in packages} == {"ps5"}
+    assert {p.title_id for p in packages} == {"PPSA04610"}
 
 
 def test_url_kind_ignores_query_and_fragment():
