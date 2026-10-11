@@ -1334,6 +1334,300 @@ def test_cloud_push_swaps_a_split_piece_for_its_manifest():
             assert calls[-1] == ("remote_pkg", piece)
 
 
+def test_proxy_token_roundtrip():
+    from pkgtool import proxy
+
+    url = (
+        "http://gs2.ww.prod.dl.playstation.net/gs2/ppkgo/prod/CUSA03041_00/48/"
+        "f_756e60f4ca0dd7575e21603b66f1d0b49885bf551ba36913e7ad17355b12a8d2/f/"
+        "UP1004-CUSA03041_00-REDEMPTION000002-A0132-V0100.json?k=v&x=1"
+    )
+    assert proxy.decode_url(proxy.encode_url(url)) == url
+
+    # The domain check: playstation.net and subdomains only.
+    assert proxy.is_proxiable("https://playstation.net/x")
+    assert proxy.is_proxiable("https://a.b.playstation.net/x")
+    assert not proxy.is_proxiable("https://playstation.net.evil.com/x")
+    assert not proxy.is_proxiable("https://example.com/x")
+
+    # Tokens decoding to foreign hosts, non-http(s) schemes, or not decoding at
+    # all are rejected: the endpoint must not relay arbitrary URLs.
+    assert proxy.decode_url(proxy.encode_url("https://example.com/x.json")) is None
+    assert proxy.decode_url(proxy.encode_url("ftp://a.playstation.net/x")) is None
+    assert proxy.decode_url("bogus!!!") is None
+
+
+def test_proxy_rewrite_manifest():
+    import json
+    from pkgtool import proxy
+
+    piece = "https://gst.prod.dl.playstation.net/gst/prod/x/y_0.pkg"
+    foreign = "https://example.com/other.pkg"
+    doc = {
+        "pieces": [
+            {"fileOffset": 0, "fileSize": 10, "hashValue": "abc", "url": piece},
+            {"url": foreign},
+        ],
+        "pieceNumber": 2,
+        "comment": "plain text",
+    }
+    out = json.loads(proxy.rewrite_manifest(json.dumps(doc).encode(), "testhost:1234"))
+
+    rewritten = out["pieces"][0]["url"]
+    assert rewritten.startswith("http://testhost:1234/proxy/")
+    assert rewritten.endswith("/y_0.pkg")  # original filename stays last
+    token = rewritten.split("/proxy/", 1)[1].rsplit("/", 1)[0]
+    assert proxy.decode_url(token) == piece
+    assert out["pieces"][1]["url"] == foreign  # foreign host untouched
+    assert out["pieceNumber"] == 2 and out["comment"] == "plain text"
+
+    # Unparseable input passes through unchanged.
+    assert proxy.rewrite_manifest(b"not json", "h:1") == b"not json"
+
+
+def test_cloud_push_proxy_rewrites_playstation_url():
+    """With proxy on, a playstation.net manifest is handed to the console as a
+    local /proxy/ URL; with it off -- or for a foreign host -- it is unchanged."""
+    from pkgtool import proxy
+
+    url = (
+        "http://gs2.ww.prod.dl.playstation.net/gs2/ppkgo/prod/CUSA03041_00/48/"
+        "f_756e60f4ca0dd7575e21603b66f1d0b49885bf551ba36913e7ad17355b12a8d2/f/"
+        "UP1004-CUSA03041_00-REDEMPTION000002-A0132-V0100.json"
+    )
+    with tempfile.TemporaryDirectory() as root:
+        app_module, client = _cloud_client(root)
+        calls = _capture_pushes(app_module)
+        with client:
+            base = {"console_ip": "127.0.0.1", "console_port": 9090}
+            r = client.post(
+                "/api/cloud/push", json={**base, "manifest_url": url, "proxy": True}
+            )
+            body = r.json()
+            assert body["ok"] is True, body
+            proxied = calls[-1][1]
+            assert proxied.startswith("http://") and "/proxy/" in proxied
+            path, _, query = proxied.partition("?")
+            # The original filename stays the last path segment...
+            assert path.endswith("/UP1004-CUSA03041_00-REDEMPTION000002-A0132-V0100.json")
+            token = path.split("/proxy/", 1)[1].rsplit("/", 1)[0]
+            assert proxy.decode_url(token) == url
+            # ...and ezremote gets its metadata query, which a signed CDN URL
+            # could not carry.
+            assert "content_id=" in query and "name=" in query
+            assert body["url"] == proxied
+
+            # Default (proxy off): the CDN URL goes to the console untouched.
+            r = client.post("/api/cloud/push", json={**base, "manifest_url": url})
+            assert calls[-1] == ("ezremote", url)
+
+            # Proxy on but a foreign host: nothing to proxy, left alone.
+            r = client.post(
+                "/api/cloud/push",
+                json={**base, "manifest_url": "https://example.com/x.json", "proxy": True},
+            )
+            assert calls[-1] == ("ezremote", "https://example.com/x.json")
+
+
+def _clear_proxy_downloads():
+    """Drop all prefetch entries, parking their workers first."""
+    from pkgtool import proxy
+    for d in proxy._downloads.values():
+        d.abort()
+    proxy._downloads.clear()
+
+
+class _FakeUpstream:
+    """Stand-in for an urllib response so the proxy endpoint can be tested
+    without network access."""
+
+    def __init__(self, data, status=200, headers=None, url=""):
+        self._data = data
+        self._pos = 0
+        self.status = status
+        self._url = url
+        # urllib responses use a case-insensitive header mapping; mirror that.
+        self.headers = {k.lower(): v for k, v in (headers or {}).items()}
+
+    def read(self, n=-1):
+        if n < 0:
+            n = len(self._data) - self._pos
+        chunk = self._data[self._pos:self._pos + n]
+        self._pos += len(chunk)
+        return chunk
+
+    def geturl(self):
+        return self._url
+
+    def close(self):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        self.close()
+
+
+class _FakeConn:
+    """Fake persistent upstream connection with the http.client shape."""
+
+    def __init__(self, body, on_range=None):
+        self._body = body
+        self._on_range = on_range
+        self._resp = None
+
+    def request(self, method, target, headers=None):
+        lo, hi = (int(x) for x in headers["Range"][6:].split("-"))
+        if self._on_range:
+            self._on_range(lo, hi)
+        data = self._body[lo:hi + 1]
+        self._resp = _FakeUpstream(data, 206, {
+            "Content-Range": f"bytes {lo}-{hi}/{len(self._body)}",
+            "Content-Length": str(len(data)),
+        })
+
+    def getresponse(self):
+        return self._resp
+
+    def close(self):
+        pass
+
+
+def test_proxy_endpoint_streams_and_rewrites(monkeypatch):
+    """Binary content is served from the prefetch cache with correct ranges;
+    manifests come back with their piece URLs pointed at the proxy."""
+    import json
+    from pkgtool import proxy
+
+    piece_url = "https://gst.prod.dl.playstation.net/gst/prod/x/y_0.pkg"
+    manifest_url = "https://gst.prod.dl.playstation.net/gst/prod/x/y.json"
+    piece_body = b"\x7fCNT" + b"\x00" * 100
+
+    def fake_open(url, range_header=None, timeout=None):
+        if url.endswith(".json"):
+            doc = {"pieces": [{"url": piece_url}], "pieceNumber": 1}
+            return _FakeUpstream(json.dumps(doc).encode())
+        if range_header:
+            lo, hi = (int(x) for x in range_header[6:].split("-"))
+            data = piece_body[lo:hi + 1]
+            return _FakeUpstream(data, 206, {
+                "Content-Type": "application/octet-stream",
+                "Content-Length": str(len(data)),
+                "Content-Range": f"bytes {lo}-{hi}/{len(piece_body)}",
+                "Accept-Ranges": "bytes",
+            }, url=url)
+        return _FakeUpstream(piece_body, 200, {
+            "Content-Type": "application/octet-stream",
+            "Content-Length": str(len(piece_body)),
+        })
+
+    # fake_open serves the probe and the manifest; block fetches go through the
+    # workers' persistent connection.
+    monkeypatch.setattr(proxy, "open_upstream", fake_open)
+    monkeypatch.setattr(proxy, "_connect", lambda url, timeout: _FakeConn(piece_body))
+
+    with tempfile.TemporaryDirectory() as root:
+        app_module, client = _cloud_client(root)
+        _clear_proxy_downloads()
+        with client:
+            # Binary piece: full body and content headers come back.
+            r = client.get(f"/proxy/{proxy.encode_url(piece_url)}")
+            assert r.status_code == 200
+            assert r.content == piece_body
+            assert r.headers["content-type"] == "application/octet-stream"
+
+            # A range request gets a 206 with correct bytes.
+            r = client.get(
+                f"/proxy/{proxy.encode_url(piece_url)}",
+                headers={"Range": "bytes=10-19"},
+            )
+            assert r.status_code == 206
+            assert r.content == piece_body[10:20]
+            assert r.headers["content-range"] == f"bytes 10-19/{len(piece_body)}"
+
+            # A manifest comes back rewritten: piece URLs point at this proxy,
+            # addressed at the host the client used (the test server's).
+            r = client.get(f"/proxy/{proxy.encode_url(manifest_url)}")
+            assert r.status_code == 200
+            doc = r.json()
+            proxied_piece = doc["pieces"][0]["url"]
+            assert proxied_piece.startswith("http://testserver/proxy/")
+            assert proxied_piece.endswith("/y_0.pkg")
+            token = proxied_piece.split("/proxy/", 1)[1].rsplit("/", 1)[0]
+            assert proxy.decode_url(token) == piece_url
+
+            # The trailing filename segment and a metadata query string are
+            # accepted and ignored.
+            r = client.get(
+                f"/proxy/{proxy.encode_url(piece_url)}/y_0.pkg?content_id=X&name=Y"
+            )
+            assert r.status_code == 200
+            assert r.content == piece_body
+
+            # Tokens that don't decode to a proxiable URL are rejected.
+            assert client.get("/proxy/bogus!!!").status_code == 400
+        _clear_proxy_downloads()
+
+
+def test_proxy_prefetch_reassembles_blocks_and_retries(monkeypatch):
+    """Workers fetch blocks over separate connections; a failed block is
+    retried transparently and the client always gets in-order bytes."""
+    from pkgtool import proxy
+
+    piece_url = "https://gst.prod.dl.playstation.net/gst/prod/x/big_0.pkg"
+    total = proxy.BLOCK_SIZE * 2 + 12345  # three blocks
+    body = (bytes(range(256)) * (total // 256 + 1))[:total]
+
+    import threading
+    lock = threading.Lock()
+    fetched = []
+
+    def fake_open(url, range_header=None, timeout=None):
+        # Only the size probe comes through here.
+        lo, hi = (int(x) for x in range_header[6:].split("-"))
+        data = body[lo:hi + 1]
+        return _FakeUpstream(data, 206, {
+            "Content-Range": f"bytes {lo}-{hi}/{total}",
+            "Content-Length": str(len(data)),
+        }, url=url)
+
+    def on_range(lo, hi):
+        with lock:
+            fetched.append((lo, hi))
+            n = fetched.count((lo, hi))
+        # The second block's first fetch dies, as CDN connections sometimes do.
+        if lo == proxy.BLOCK_SIZE and n == 1:
+            raise OSError("connection reset by peer")
+
+    monkeypatch.setattr(proxy, "open_upstream", fake_open)
+    monkeypatch.setattr(proxy, "_connect", lambda url, timeout: _FakeConn(body, on_range))
+
+    with tempfile.TemporaryDirectory() as root:
+        app_module, client = _cloud_client(root)
+        _clear_proxy_downloads()
+        with client:
+            r = client.get(f"/proxy/{proxy.encode_url(piece_url)}")
+            assert r.status_code == 200
+            assert r.headers["content-length"] == str(total)
+            assert r.content == body
+
+            # A mid-file range reads from the shared cache entry.
+            r = client.get(
+                f"/proxy/{proxy.encode_url(piece_url)}",
+                headers={"Range": f"bytes={proxy.BLOCK_SIZE + 5}-{proxy.BLOCK_SIZE + 100}"},
+            )
+            assert r.status_code == 206
+            assert r.content == body[proxy.BLOCK_SIZE + 5:proxy.BLOCK_SIZE + 101]
+        _clear_proxy_downloads()
+
+    # The failed block was fetched twice during the full read (one reset + one
+    # retry), then once more for the follow-up range: the full read's single
+    # advancing reader had already evicted it.
+    block1 = (proxy.BLOCK_SIZE, proxy.BLOCK_SIZE * 2 - 1)
+    assert fetched.count(block1) == 3
+
+
 def test_group_sources_numbered_split_with_divergent_sc_name():
     """A numbered chunk set whose SC carries a different content id is paired
     structurally, in chunk order, with the SC last."""

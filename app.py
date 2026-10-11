@@ -14,14 +14,16 @@ from __future__ import annotations
 
 import html
 import json
+import logging
 import os
 import re
 import socket
+import time
 import urllib.error
 import urllib.request
 from contextlib import asynccontextmanager
 from typing import Dict, List, Optional, Tuple
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 from xml.etree import ElementTree
 
 from fastapi import FastAPI, Request
@@ -31,7 +33,10 @@ from pydantic import BaseModel
 
 from pkgtool import ConcatSource
 from pkgtool import entitlements
+from pkgtool import proxy
 from pkgtool.scan import PkgRecord, ScanResult, scan, group_by_title_id
+
+logger = logging.getLogger("uvicorn.error")
 
 ICON_DIR = os.environ.get("ICON_DIR", os.path.join("cache", "icons"))
 SCAN_WORKERS = int(os.environ.get("SCAN_WORKERS", "8"))
@@ -248,6 +253,7 @@ def _render_index(result: Optional[ScanResult]) -> str:
   .sheethead {{ display: flex; gap: 8px; padding: 12px; border-bottom: 1px solid #2a2e35; }}
   .sheethead input {{ flex: 1 1 auto; min-width: 0; }}
   .sheethead select {{ flex: 0 0 auto; }}
+  .cproxy {{ display: flex; align-items: center; gap: 5px; flex: 0 0 auto; font-size: 12px; color: #c4c8ce; white-space: nowrap; cursor: pointer; }}
   .btn.close {{ background: #374151; color: #e8eaed; font-size: 22px; line-height: 1; }}
   .btn.close:hover {{ background: #4b5563; }}
   .sheetbody {{ overflow-y: auto; padding: 6px; }}
@@ -403,6 +409,9 @@ def _render_index(result: Optional[ScanResult]) -> str:
         <option value="ps5">PS5</option>
         <option value="ps4">PS4</option>
       </select>
+      <label class="cproxy" title="Route *.playstation.net downloads through this server instead of having the console fetch them directly">
+        <input type="checkbox" id="cloudproxy"> Proxy
+      </label>
       <button class="btn close" onclick="cloudClose()" aria-label="Close">&times;</button>
     </div>
     <div id="cloudbody" class="sheetbody"></div>
@@ -745,7 +754,8 @@ async function cloudPush(pkg) {{
       body: JSON.stringify({{
         console_ip: c.ip, console_port: c.port, protocol: c.proto,
         manifest_url: pkg.manifest_url, content_id: pkg.content_id,
-        name: pkg.name || '', title: pkg.title || ''
+        name: pkg.name || '', title: pkg.title || '',
+        proxy: document.getElementById('cloudproxy').checked
       }})
     }});
     j = await r.json();
@@ -773,6 +783,10 @@ async function cloudPush(pkg) {{
     localStorage.setItem(platKey, plat.value);
     cloudRefresh();
   }});
+  const prox = document.getElementById('cloudproxy');
+  const proxKey = 'pkgserver_cloudproxy';
+  prox.checked = localStorage.getItem(proxKey) === '1';
+  prox.addEventListener('change', () => localStorage.setItem(proxKey, prox.checked ? '1' : '0'));
   cloudEl().addEventListener('click', ev => {{ if (ev.target === cloudEl()) cloudClose(); }});
   document.addEventListener('keydown', ev => {{
     if (ev.key === 'Escape' && !cloudEl().hidden) cloudClose();
@@ -954,6 +968,123 @@ def _serve_split(parts, filename: str, request: Request):
     return StreamingResponse(
         body(), status_code=status, media_type="application/octet-stream", headers=headers
     )
+
+
+# Binary proxy content is served from the prefetch cache in pkgtool/proxy.py:
+@app.api_route("/proxy/{token}", methods=["GET", "HEAD"])
+@app.api_route("/proxy/{token}/{filename}", methods=["GET", "HEAD"])
+def proxy_cdn(token: str, request: Request, filename: str = ""):
+    """Relay a *.playstation.net URL the console was handed by a proxied push.
+
+    The token is the base64url-encoded original URL (see pkgtool/proxy.py).
+    A trailing filename segment is cosmetic -- it keeps the original name last
+    in the path for installers that derive a title from it -- and any query
+    string is ignored, so push protocols can decorate the URL with metadata.
+    JSON manifests are rewritten so their piece URLs point back here; binary
+    content is prefetched in parallel blocks so installs stay resumable and
+    fast despite per-connection CDN throttling.
+    """
+    client = request.client.host if request.client else "?"
+    range_header = request.headers.get("range")
+    t0 = time.monotonic()
+    url = proxy.decode_url(token)
+    if url is None:
+        logger.warning("proxy: rejected token from %s", client)
+        return JSONResponse({"error": "not a proxiable URL"}, status_code=400)
+    logger.info(
+        "proxy: %s %s range=%s ua=%s from %s",
+        request.method, url, range_header or "-",
+        request.headers.get("user-agent", "-"), client,
+    )
+
+    if urlsplit(url).path.lower().endswith(".json"):
+        # Manifests are small: fetch whole, rewrite piece URLs to point back at
+        # this proxy, and serve the result. The console reached us on the Host
+        # it sent, so that is the authority its piece fetches must use too.
+        try:
+            with proxy.open_upstream(url) as resp:
+                raw = resp.read()
+                body = proxy.rewrite_manifest(raw, request.headers["host"])
+        except urllib.error.HTTPError as e:
+            logger.warning("proxy: upstream returned %s for %s", e.code, url)
+            return JSONResponse({"error": f"upstream returned {e.code}"}, status_code=e.code)
+        except (urllib.error.URLError, OSError) as e:
+            logger.warning("proxy: upstream fetch failed for %s: %s", url, e)
+            return JSONResponse({"error": str(e)}, status_code=502)
+        logger.info(
+            "proxy: manifest %s rewrote %d -> %d bytes in %.2fs",
+            url, len(raw), len(body), time.monotonic() - t0,
+        )
+        if request.method == "HEAD":
+            return Response(
+                status_code=200,
+                media_type="application/json",
+                headers={"Content-Length": str(len(body))},
+            )
+        return Response(content=body, status_code=200, media_type="application/json")
+
+    # Binary content is served out of a prefetch cache: the CDN throttles per
+    # connection, so several workers pull blocks in parallel while the console
+    # reads them back sequentially.
+    try:
+        if request.method == "HEAD":
+            return Response(
+                status_code=200,
+                headers={
+                    "Content-Type": "application/octet-stream",
+                    "Accept-Ranges": "bytes",
+                    "Content-Length": str(proxy.head_total(url)),
+                },
+            )
+        dl = proxy.get_download(url)
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        logger.warning("proxy: upstream probe failed for %s: %s", url, e)
+        return JSONResponse({"error": str(e)}, status_code=502)
+
+    start, end = 0, dl.total - 1
+    status = 200
+    if range_header and range_header.startswith("bytes="):
+        first, _, last = range_header[6:].split(",")[0].strip().partition("-")
+        try:
+            if first == "":  # suffix range: last N bytes
+                start = max(0, dl.total - int(last))
+            else:
+                start = int(first)
+                end = int(last) if last else dl.total - 1
+        except ValueError:
+            start, end = 0, -1
+        end = min(end, dl.total - 1)
+        if start > end or start >= dl.total:
+            return Response(status_code=416, headers={"Content-Range": f"bytes */{dl.total}"})
+        status = 206
+
+    headers = {
+        "Content-Type": "application/octet-stream",
+        "Accept-Ranges": "bytes",
+        "Content-Length": str(end - start + 1),
+    }
+    if status == 206:
+        headers["Content-Range"] = f"bytes {start}-{end}/{dl.total}"
+
+    def body():
+        sent = 0
+        try:
+            for chunk in dl.read(start, end):
+                sent += len(chunk)
+                yield chunk
+        except Exception as e:  # noqa: BLE001 - prefetch failed mid-stream
+            # Ending the body early truncates the response; the console retries
+            # the range, which gets a fresh download entry.
+            logger.warning("proxy: stream of %s aborted: %s", url, e)
+        finally:
+            elapsed = time.monotonic() - t0
+            logger.info(
+                "proxy: streamed %d bytes of %s to %s in %.2fs (%.1f MB/s)",
+                sent, url, client, elapsed,
+                sent / elapsed / (1024 * 1024) if elapsed > 0 else 0.0,
+            )
+
+    return StreamingResponse(body(), status_code=status, headers=headers)
 
 
 # Supported console push protocols. "ezremote" is the original MangoScango/
@@ -1229,15 +1360,18 @@ class CloudPushRequest(BaseModel):
     name: str = ""
     title: str = ""
     protocol: str = "ezremote"
+    proxy: bool = False
 
 
 @app.post("/api/cloud/push")
-def api_cloud_push(req: CloudPushRequest) -> JSONResponse:
+def api_cloud_push(req: CloudPushRequest, request: Request) -> JSONResponse:
     """Hand a console a Sony manifest URL to install from.
 
     Unlike ``/api/push`` the console downloads straight from Sony, so no local
-    package or download URL is involved.
+    package or download URL is involved -- unless ``proxy`` is set, in which
+    case a playstation.net URL is traded for a local ``/proxy/`` URL we relay.
     """
+    logger.info("cloud push: url=%s proxy=%s -> %s:%s", req.manifest_url, req.proxy, req.console_ip, req.console_port)
     protocol = (req.protocol or "ezremote").lower()
     if protocol not in PUSH_PROTOCOLS:
         return JSONResponse(
@@ -1252,12 +1386,28 @@ def api_cloud_push(req: CloudPushRequest) -> JSONResponse:
     if protocol != "remote_pkg":
         url = entitlements.manifest_url_for(url)
 
+    # With proxying on, a playstation.net URL is traded for a local /proxy URL
+    # the console fetches from us; we relay it upstream (and rewrite manifests).
+    proxied = False
+    if req.proxy and proxy.is_proxiable(url):
+        http_port = request.url.port or (443 if request.url.scheme == "https" else 80)
+        authority, _ = _server_authority(req.console_ip, req.console_port, http_port)
+        # The original filename stays the last path segment: installers derive a
+        # display name from it, and a raw base64 token would blow the installer's
+        # title-name length limit.
+        filename = urlsplit(url).path.rsplit("/", 1)[-1] or "manifest.json"
+        url = f"http://{authority}/proxy/{proxy.encode_url(url)}/{filename}"
+        proxied = True
+
     name = req.name or req.title or req.content_id or url.rsplit("/", 1)[-1]
     try:
         if protocol == "ezremote":
             # ezremote-dpi takes metadata only as a query string on the URL it is
-            # handed, and Sony's CDN paths are hash-signed; a display name is not
-            # worth risking the download for. etaHEN has its own fields below.
+            # handed. A signed Sony CDN URL can't be decorated, but a proxied URL
+            # is ours -- the proxy endpoint ignores the query string.
+            if proxied:
+                params = urlencode({"content_id": req.content_id, "name": name, "icon": ""})
+                url = f"{url}?{params}"
             result = _push_ezremote(req.console_ip, req.console_port, url)
         elif protocol == "remote_pkg":
             result = _push_remote_pkg(req.console_ip, req.console_port, url)
@@ -1277,6 +1427,7 @@ def api_cloud_push(req: CloudPushRequest) -> JSONResponse:
     except urllib.error.URLError as e:
         return JSONResponse({"ok": False, "error": str(e.reason)}, status_code=502)
 
+    logger.info(url)
     return JSONResponse({"ok": True, "protocol": protocol, "url": url, **result})
 
 

@@ -28,9 +28,9 @@ Then open http://localhost:8000.
   them all in `PKG_DIRS` (e.g. `/pkgs:/pkgs2`).
 
 
-## Cloud install
+## Cloud Push
 
-You can push retail titles directly from the CDN to your console with the cloud icon in the header. If you contribute your entitlements database to [Garlic Saves](https://garlicsaves.com/tools/entitlements), you can export the result and search through it dynamically. Afterwards upload just the `entitlements_all.csv` to the server or drop it in the scripts working directory. Without a catalogue you can still paste a direct `.pkg`, `.json` manifest, or `version.xml` URL into the search box to install from it. Updates from [OrbisPatches](https://www.orbispatches.com) will work automatically, just paste the link for any pkg piece and the server will push the full update. For PS5, use the `SC` pkg link provided by [ProsperoPatches](https://prosperopatches.com/).
+You can push retail titles directly from the CDN to your console by clicking the cloud icon in the header. You can search through your PSN entitlements by contributing your entitlements database to [Garlic Saves](https://garlicsaves.com/tools/entitlements). Afterwards, just export and upload the `entitlements_all.csv` to the server or drop it in the scripts working directory. You can also paste a direct `.pkg`, `.json` manifest, or `version.xml` URL into the search box to install from it directly. Updates from [OrbisPatches](https://www.orbispatches.com) will work automatically, just paste the link for any pkg piece and the server will push the full update. For PS5, use the `SC` pkg link provided by [ProsperoPatches](https://prosperopatches.com/). When pushing from the CDN, you can additionally proxy the content through the server to bypass any DNS blocks on console. The server will prefetch content as the console moves through the download, so this can actually improve your download speed if you find PSN typically does not saturate your connection.
 
 ## Special Thanks
 
