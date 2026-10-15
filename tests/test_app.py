@@ -1456,6 +1456,11 @@ class _FakeUpstream:
         self._pos += len(chunk)
         return chunk
 
+    def readinto(self, buf):
+        chunk = self.read(len(buf))
+        buf[:len(chunk)] = chunk
+        return len(chunk)
+
     def geturl(self):
         return self._url
 
@@ -1626,6 +1631,58 @@ def test_proxy_prefetch_reassembles_blocks_and_retries(monkeypatch):
     # advancing reader had already evicted it.
     block1 = (proxy.BLOCK_SIZE, proxy.BLOCK_SIZE * 2 - 1)
     assert fetched.count(block1) == 3
+
+
+def test_proxy_global_cache_budget_and_idle_retention(monkeypatch):
+    """The cache budget is global across downloads, and a download whose last
+    reader detached trims its cache to a small tail window instead of keeping
+    the whole prefetch for the stale sweep."""
+    from pkgtool import proxy
+
+    monkeypatch.setattr(proxy, "MAX_CACHED_BYTES", proxy.BLOCK_SIZE * 2)
+
+    dl_a = proxy.Download("http://x/a.pkg", "http://x/a.pkg", proxy.BLOCK_SIZE * 8)
+    dl_b = proxy.Download("http://x/b.pkg", "http://x/b.pkg", proxy.BLOCK_SIZE * 8)
+
+    def stock(dl, indices):
+        for i in indices:
+            dl._blocks[i] = bytearray(proxy.BLOCK_SIZE)
+            dl._cached += proxy.BLOCK_SIZE
+            proxy._cache_charge(proxy.BLOCK_SIZE)
+
+    try:
+        # A holds two blocks -- the whole global budget.
+        with dl_a._cond:
+            stock(dl_a, (0, 1))
+            dl_a._readers[0] = 1  # reading block 1
+
+        # B's reader sits on a cached block with prefetch left to do: nothing is
+        # starved, and the global budget is full -> B's workers must park even
+        # though B's own cache is nearly empty.
+        with dl_b._cond:
+            stock(dl_b, (5,))
+            dl_b._readers[0] = 5
+            assert dl_b._idle_locked()
+
+        # A starved reader (waiting on an unfetched block) overrides the budget,
+        # or prefetch would deadlock.
+        with dl_b._cond:
+            dl_b._readers[0] = 6
+            assert not dl_b._idle_locked()
+
+        # Once the last reader detaches, only the newest KEEP_BLOCKS_WHEN_IDLE
+        # blocks survive; anything older refetches on demand.
+        with dl_a._cond:
+            dl_a._readers.clear()
+            stock(dl_a, range(2, 8))
+            before = proxy._total_cached
+            dl_a._evict_passed_locked()
+            assert sorted(dl_a._blocks) == [4, 5, 6, 7]
+            assert proxy._total_cached == before - 4 * proxy.BLOCK_SIZE
+    finally:
+        dl_a.abort()
+        dl_b.abort()
+    assert proxy._total_cached == 0
 
 
 def test_group_sources_numbered_split_with_divergent_sc_name():

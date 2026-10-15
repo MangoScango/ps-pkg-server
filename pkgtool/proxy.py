@@ -12,9 +12,11 @@ from __future__ import annotations
 
 import base64
 import bisect
+import ctypes
 import http.client
 import json
 import logging
+import mmap
 import os
 import ssl
 import threading
@@ -133,9 +135,15 @@ def _connect(url: str, timeout: int):
 # connections ahead of the console's sequential reads.
 BLOCK_SIZE = int(os.environ.get("PROXY_BLOCK_MB", "8")) * 1024 * 1024
 PREFETCH_WORKERS = int(os.environ.get("PROXY_WORKERS", "16"))
+# Budget for unread prefetched blocks, GLOBAL across all downloads: a split
+# package creates one Download per piece, and a per-entry cap would scale RSS
+# with the piece count.
 MAX_CACHED_BYTES = int(os.environ.get("PROXY_CACHE_MB", "1024")) * 1024 * 1024
+# Blocks kept cached once the last reader detaches
+KEEP_BLOCKS_WHEN_IDLE = 4
 MAX_BLOCK_ATTEMPTS = 5
 STALE_AFTER = 300  # seconds without a reader before an entry is dropped
+SWEEP_INTERVAL = 30  # seconds between background stale-entry sweeps
 # A silent upstream connection is abandoned and the block's remaining bytes
 # resume on a fresh one. This is the max seconds without bytes before
 # reconnecting, not a whole-transfer deadline.
@@ -147,14 +155,46 @@ class _BadStatus(Exception):
     """The upstream answered a ranged GET with a non-206 status."""
 
 
+# Bytes currently held in prefetch blocks across ALL downloads. Leaf lock:
+# never acquire a Download's condition or _downloads_lock while holding it.
+_cache_lock = threading.Lock()
+_total_cached = 0
+
+
+def _cache_charge(n: int) -> None:
+    global _total_cached
+    with _cache_lock:
+        _total_cached += n
+
+
+def _cache_release(n: int) -> None:
+    global _total_cached
+    with _cache_lock:
+        _total_cached -= n
+
+
+def _malloc_trim() -> None:
+    """Return free heap pages to the OS (glibc only; no-op elsewhere).
+
+    Prefetch blocks are anonymous mmaps and bypass the heap entirely (see
+    _fetch_block), so this only matters for the small-allocation heap around
+    them. Only the main arena is trimmed, so it works as intended with
+    MALLOC_ARENA_MAX=1 (set in the Dockerfile).
+    """
+    try:
+        ctypes.CDLL(None).malloc_trim(0)
+    except (AttributeError, OSError):
+        pass
+
+
 class Download:
     """Whole-file prefetch of one CDN URL, read back block by block.
 
     Workers claim blocks in order and fetch them from the resolved edge URL,
     each over its own persistent connection; readers (the console's range
     requests) consume them in order and wait on whatever isn't cached yet.
-    Blocks below every active reader are evicted, and workers pause once
-    MAX_CACHED_BYTES are cached unread.
+    Blocks below every active reader are evicted, and workers pause once the
+    global MAX_CACHED_BYTES budget is cached unread.
 
     Workers park (rather than exit) when there is nothing to fetch, and stay
     until the entry is aborted by the stale sweep: a reader that attaches at
@@ -171,7 +211,7 @@ class Download:
         self._pending = list(range(self.nblocks))  # sorted block indices
         self._cursor = 0  # where prefetch continues while no reader is attached
         self._started = False
-        self._blocks: Dict[int, bytes] = {}
+        self._blocks: Dict[int, mmap.mmap] = {}
         self._inflight = set()
         self._attempts: Dict[int, int] = {}
         self._cached = 0
@@ -218,15 +258,19 @@ class Download:
     def abort(self) -> None:
         with self._cond:
             self.aborted = True
+            if self._blocks:
+                _cache_release(sum(len(b) for b in self._blocks.values()))
+                self._blocks.clear()
+                self._cached = 0
             self._cond.notify_all()
 
     def _idle_locked(self) -> bool:
-        """Whether a worker should park: nothing pending, or the unread cache
-        is full and no reader is starved on a block still to be fetched (a
-        re-fetched evicted block -- pausing then would deadlock it)."""
+        """Whether a worker should park: nothing pending, or the global unread
+        cache budget is full and no reader is starved on a block still to be
+        fetched (a re-fetched evicted block -- pausing then would deadlock it)."""
         if self._next_pending_locked() is None:
             return True
-        if self._cached < MAX_CACHED_BYTES:
+        if _total_cached < MAX_CACHED_BYTES:
             return False
         return not any(
             pos not in self._blocks and self._is_pending(pos)
@@ -252,17 +296,24 @@ class Download:
         on a fresh one; only repeated back-to-back failures give up. A non-206
         status re-resolves the origin's redirect first -- the edge URL may have
         expired.
+
+        The block is an anonymous mmap, not a heap allocation: evicting it
+        returns the pages to the kernel immediately, so the process RSS -- what
+        a container's reported memory is -- actually falls after a transfer
+        instead of pinning the high-water mark in allocator free lists.
         """
         start = idx * BLOCK_SIZE
         want = min(start + BLOCK_SIZE, self.total) - start
-        buf = bytearray()
+        buf = mmap.mmap(-1, want)
+        view = memoryview(buf)
+        got = 0
         consecutive_errors = 0
         t_block = time.monotonic()
-        while len(buf) < want:
+        while got < want:
             url, target = self._resolved
             if conn is None:
                 conn = _connect(url, BLOCK_FETCH_TIMEOUT)
-            lo, hi = start + len(buf), start + want - 1
+            lo, hi = start + got, start + want - 1
             t_conn = time.monotonic()
             try:
                 conn.request("GET", target, headers={"Range": f"bytes={lo}-{hi}"})
@@ -270,11 +321,11 @@ class Download:
                 if resp.status != 206:
                     resp.read()  # drain so the connection could be reused
                     raise _BadStatus(resp.status)
-                while len(buf) < want:
-                    chunk = resp.read(want - len(buf))
-                    if not chunk:
-                        raise IOError(f"early EOF: got {len(buf)}, wanted {want}")
-                    buf += chunk
+                while got < want:
+                    n = resp.readinto(view[got:])
+                    if not n:
+                        raise IOError(f"early EOF: got {got}, wanted {want}")
+                    got += n
             except Exception as e:  # noqa: BLE001 - dropped/stalled connection
                 # Bytes already received are kept; the remainder resumes on a
                 # fresh connection. Only repeated back-to-back failures give up.
@@ -290,7 +341,7 @@ class Download:
                     self._reresolve()
                 logger.info(
                     "proxy: block %d of %s reconnecting (%.1fs, %d/%d bytes): %s",
-                    idx, self.url, time.monotonic() - t_conn, len(buf), want, e,
+                    idx, self.url, time.monotonic() - t_conn, got, want, e,
                 )
                 continue
             consecutive_errors = 0
@@ -298,9 +349,10 @@ class Download:
         if elapsed > 2:
             logger.info(
                 "proxy: slow block %d of %s: %.1fs (%.1f MB/s)",
-                idx, self.url, elapsed, len(buf) / elapsed / (1024 * 1024),
+                idx, self.url, elapsed, want / elapsed / (1024 * 1024),
             )
-        return bytes(buf), conn
+        view.release()
+        return buf, conn
 
     def _work(self) -> None:
         conn = None
@@ -319,6 +371,7 @@ class Download:
             try:
                 data, conn = self._fetch_block(idx, conn)
             except Exception as e:  # noqa: BLE001 - any fetch failure is retried
+                data = None
                 if conn is not None:
                     conn.close()
                     conn = None
@@ -337,9 +390,14 @@ class Download:
                 continue
             with self._cond:
                 self._inflight.discard(idx)
+                if self.aborted:
+                    continue
                 self._blocks[idx] = data
-                self._cached += len(data)
-                self._note_block_locked(time.monotonic() - t_fetch, len(data), reused)
+                size = len(data)
+                self._cached += size
+                _cache_charge(size)
+                data = None
+                self._note_block_locked(time.monotonic() - t_fetch, size, reused)
                 self._cond.notify_all()
 
     def _note_block_locked(self, seconds: float, size: int, reused: bool) -> None:
@@ -417,7 +475,8 @@ class Download:
                     self.last_active = time.monotonic()
                 offset = pos - idx * BLOCK_SIZE
                 take = min(len(data) - offset, end - pos + 1)
-                yield data[offset:offset + take]
+                # Stored blocks are never resized, so a zero-copy view is safe.
+                yield memoryview(data)[offset:offset + take]
                 pos += take
                 if pos >= idx * BLOCK_SIZE + len(data):
                     idx += 1
@@ -431,12 +490,26 @@ class Download:
                 self._evict_passed_locked()
 
     def _evict_passed_locked(self) -> None:
-        """Drop blocks every active reader has moved past, waking paused workers."""
-        if not self._readers:
-            return  # no readers: keep everything for a returning console
-        watermark = min(self._readers.values())
-        for idx in [i for i in self._blocks if i < watermark]:
-            self._cached -= len(self._blocks.pop(idx))
+        """Drop blocks every active reader has moved past, waking paused workers.
+
+        Once the last reader detaches, only the KEEP_BLOCKS_WHEN_IDLE most
+        recent blocks survive: a returning console resumes instantly for
+        near-current ranges, while anything older refetches through read()'s
+        requeue path instead of pinning the whole window until the stale sweep.
+        """
+        if self._readers:
+            watermark = min(self._readers.values())
+            drop = [i for i in self._blocks if i < watermark]
+        else:
+            keep = set(sorted(self._blocks)[-KEEP_BLOCKS_WHEN_IDLE:])
+            drop = [i for i in self._blocks if i not in keep]
+        freed = 0
+        for idx in drop:
+            freed += len(self._blocks.pop(idx))
+        if freed:
+            self._cached -= freed
+            _cache_release(freed)
+            _malloc_trim()
         self._cond.notify_all()
 
 
@@ -455,6 +528,41 @@ def _probe(url: str) -> Tuple[int, str]:
         return int(content_range.rsplit("/", 1)[1]), resp.geturl()
 
 
+def _sweep_stale_locked() -> bool:
+    """Abort entries no reader has touched for STALE_AFTER. True if any went.
+
+    Caller must hold ``_downloads_lock``.
+    """
+    stale = [k for k, d in _downloads.items() if d.stale()]
+    for key in stale:
+        _downloads.pop(key).abort()
+    return bool(stale)
+
+
+def _sweeper() -> None:
+    """Drop stale downloads on a timer, not just when a new request arrives.
+
+    Without this, the sweep in get_download never runs once an install is over,
+    and every finished piece's cache would sit in memory indefinitely.
+    """
+    while True:
+        time.sleep(SWEEP_INTERVAL)
+        with _downloads_lock:
+            swept = _sweep_stale_locked()
+        if swept:
+            _malloc_trim()
+
+
+_sweeper_started = False
+
+
+def _ensure_sweeper() -> None:
+    global _sweeper_started
+    if not _sweeper_started:
+        _sweeper_started = True
+        threading.Thread(target=_sweeper, daemon=True, name="proxy-sweeper").start()
+
+
 def get_download(url: str) -> Download:
     """Return the (possibly new) prefetch entry for a URL.
 
@@ -462,8 +570,8 @@ def get_download(url: str) -> Download:
     a console retry starts fresh.
     """
     with _downloads_lock:
-        for key in [k for k, d in _downloads.items() if d.stale()]:
-            _downloads.pop(key).abort()
+        _ensure_sweeper()
+        _sweep_stale_locked()
         dl = _downloads.get(url)
         if dl is not None and dl.error is not None:
             dl.abort()

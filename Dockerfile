@@ -5,7 +5,10 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     ICON_DIR=/data/icons \
     ENTITLEMENTS_CSV=/data/entitlements_all.csv \
-    SCAN_WORKERS=8
+    SCAN_WORKERS=8 \
+    # Prefetch blocks are allocated in worker threads; a single malloc arena lets
+    # the proxy's malloc_trim calls return evicted cache memory to the OS.
+    MALLOC_ARENA_MAX=1
 
 WORKDIR /app
 
