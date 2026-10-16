@@ -1,2 +1,3 @@
 fastapi>=0.110
 uvicorn[standard]>=0.29
+ps-pkg-info @ https://github.com/MangoScango/ps-pkg-info/archive/refs/heads/main.tar.gz

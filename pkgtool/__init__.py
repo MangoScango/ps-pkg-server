@@ -1,11 +1,6 @@
-"""PS4 PKG metadata parser and scanner.
+"""PKG scanner, grouping, discovery and proxy helpers."""
 
-Pure-Python, dependency-free parsing of PS4 .pkg files. Only the unencrypted
-metadata region (header + entry table + param.sfo + icon0.png) is read, so no
-decryption is required and only the first chunk of each file is touched.
-"""
-
-from .pkg import (
+from ps_pkg_info import (
     ByteSource,
     FileSource,
     BytesSource,

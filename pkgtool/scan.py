@@ -15,7 +15,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, asdict
 from typing import Dict, List, Optional
 
-from .pkg import (
+from ps_pkg_info.pkg import (
     ConcatSource,
     FileSource,
     Pkg,
