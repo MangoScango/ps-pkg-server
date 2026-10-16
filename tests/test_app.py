@@ -1851,9 +1851,10 @@ def test_proxy_prefetch_reassembles_blocks_and_retries(monkeypatch):
 
 
 def test_proxy_global_cache_budget_and_idle_retention(monkeypatch):
-    """The cache budget is global across downloads, and a download whose last
-    reader detached trims its cache to a small tail window instead of keeping
-    the whole prefetch for the stale sweep."""
+    """The cache budget is global across downloads; a plain reader detach keeps
+    the cache whole (the console detaches between its sequential range
+    requests), and only budget pressure shrinks an idle download to its resume
+    window."""
     from pkgtool import proxy
 
     monkeypatch.setattr(proxy, "MAX_CACHED_BYTES", proxy.BLOCK_SIZE * 2)
@@ -1887,19 +1888,76 @@ def test_proxy_global_cache_budget_and_idle_retention(monkeypatch):
             dl_b._readers[0] = 6
             assert not dl_b._idle_locked()
 
-        # Once the last reader detaches, only the newest KEEP_BLOCKS_WHEN_IDLE
-        # blocks survive; anything older refetches on demand.
+        # The console detaches between its sequential range requests, so a
+        # plain detach must NOT trim the cache, or the next request would wait
+        # on (re)fetches of blocks that were already downloaded.
         with dl_a._cond:
             dl_a._readers.clear()
+            dl_a._evict_passed_locked()
+            assert sorted(dl_a._blocks) == [0, 1]
+
+        # Under budget pressure, a readerless download is shrunk to a window at
+        # its resume point -- the blocks a returning console asks for next.
+        # (Anchoring anywhere else would evict exactly those and refetch them.)
+        with dl_a._cond:
+            dl_a._cursor = 4  # reader detached having read up to block 4
             stock(dl_a, range(2, 8))
             before = proxy._total_cached
-            dl_a._evict_passed_locked()
+            dl_a._trim_idle_locked()
             assert sorted(dl_a._blocks) == [4, 5, 6, 7]
             assert proxy._total_cached == before - 4 * proxy.BLOCK_SIZE
     finally:
         dl_a.abort()
         dl_b.abort()
     assert proxy._total_cached == 0
+
+
+def test_proxy_detached_reads_never_refetch(monkeypatch):
+    """Reading a piece as a sequence of separate range requests (how the
+    console actually reads) must serve every block from cache exactly once."""
+    from pkgtool import proxy
+
+    piece_url = "https://gst.prod.dl.playstation.net/gst/prod/x/seq_0.pkg"
+    total = proxy.BLOCK_SIZE * 4
+    body = (bytes(range(256)) * (total // 256 + 1))[:total]
+
+    import threading
+    lock = threading.Lock()
+    fetched = []
+
+    def fake_open(url, range_header=None, timeout=None):
+        lo, hi = (int(x) for x in range_header[6:].split("-"))
+        data = body[lo:hi + 1]
+        return _FakeUpstream(data, 206, {
+            "Content-Range": f"bytes {lo}-{hi}/{total}",
+            "Content-Length": str(len(data)),
+        }, url=url)
+
+    def on_range(lo, hi):
+        with lock:
+            fetched.append((lo, hi))
+
+    monkeypatch.setattr(proxy, "open_upstream", fake_open)
+    monkeypatch.setattr(proxy, "_connect", lambda url, timeout: _FakeConn(body, on_range))
+
+    with tempfile.TemporaryDirectory() as root:
+        app_module, client = _cloud_client(root)
+        _clear_proxy_downloads()
+        with client:
+            for i in range(4):
+                lo, hi = i * proxy.BLOCK_SIZE, (i + 1) * proxy.BLOCK_SIZE - 1
+                r = client.get(
+                    f"/proxy/{proxy.encode_url(piece_url)}",
+                    headers={"Range": f"bytes={lo}-{hi}"},
+                )
+                assert r.status_code == 206
+                assert r.content == body[lo:hi + 1]
+        _clear_proxy_downloads()
+
+    # Prefetch may race ahead, but no block may ever be fetched twice.
+    for i in range(4):
+        block = (i * proxy.BLOCK_SIZE, (i + 1) * proxy.BLOCK_SIZE - 1)
+        assert fetched.count(block) == 1
 
 
 def test_group_sources_numbered_split_with_divergent_sc_name():

@@ -139,7 +139,8 @@ PREFETCH_WORKERS = int(os.environ.get("PROXY_WORKERS", "16"))
 # package creates one Download per piece, and a per-entry cap would scale RSS
 # with the piece count.
 MAX_CACHED_BYTES = int(os.environ.get("PROXY_CACHE_MB", "1024")) * 1024 * 1024
-# Blocks kept cached once the last reader detaches
+# Blocks an idle download keeps when the global budget is under pressure: a
+# window at its resume point, so a returning console still resumes instantly.
 KEEP_BLOCKS_WHEN_IDLE = 4
 MAX_BLOCK_ATTEMPTS = 5
 STALE_AFTER = 300  # seconds without a reader before an entry is dropped
@@ -176,10 +177,9 @@ def _cache_release(n: int) -> None:
 def _malloc_trim() -> None:
     """Return free heap pages to the OS (glibc only; no-op elsewhere).
 
-    Prefetch blocks are anonymous mmaps and bypass the heap entirely (see
-    _fetch_block), so this only matters for the small-allocation heap around
-    them. Only the main arena is trimmed, so it works as intended with
-    MALLOC_ARENA_MAX=1 (set in the Dockerfile).
+    Prefetch blocks live in anonymous mmaps, so freed cache returns to the OS
+    directly. Only the main heap arena is trimmed, and only for the small
+    allocations around the blocks.
     """
     try:
         ctypes.CDLL(None).malloc_trim(0)
@@ -262,6 +262,7 @@ class Download:
                 _cache_release(sum(len(b) for b in self._blocks.values()))
                 self._blocks.clear()
                 self._cached = 0
+                _malloc_trim()
             self._cond.notify_all()
 
     def _idle_locked(self) -> bool:
@@ -492,24 +493,40 @@ class Download:
     def _evict_passed_locked(self) -> None:
         """Drop blocks every active reader has moved past, waking paused workers.
 
-        Once the last reader detaches, only the KEEP_BLOCKS_WHEN_IDLE most
-        recent blocks survive: a returning console resumes instantly for
-        near-current ranges, while anything older refetches through read()'s
-        requeue path instead of pinning the whole window until the stale sweep.
+        With no readers the cache is kept whole for a returning console: the
+        console detaches between its sequential range requests, so trimming on
+        detach would evict blocks it is about to ask for (and prefetch would
+        fetch them twice). Idle memory is instead bounded by the global
+        MAX_CACHED_BYTES budget and reclaimed by the stale sweep.
         """
-        if self._readers:
-            watermark = min(self._readers.values())
-            drop = [i for i in self._blocks if i < watermark]
-        else:
-            keep = set(sorted(self._blocks)[-KEEP_BLOCKS_WHEN_IDLE:])
-            drop = [i for i in self._blocks if i not in keep]
+        if not self._readers:
+            return
+        watermark = min(self._readers.values())
         freed = 0
-        for idx in drop:
+        for idx in [i for i in self._blocks if i < watermark]:
             freed += len(self._blocks.pop(idx))
         if freed:
             self._cached -= freed
             _cache_release(freed)
-            _malloc_trim()
+        self._cond.notify_all()
+
+    def _trim_idle_locked(self) -> None:
+        """Budget pressure relief: shrink a readerless download to a small
+        window at its resume point.
+
+        Only called when the global budget is full (get_download). Anything
+        beyond the window refetches through read()'s requeue path if the
+        console returns.
+        """
+        if self._readers:
+            return
+        window = set(range(self._cursor, self._cursor + KEEP_BLOCKS_WHEN_IDLE))
+        freed = 0
+        for idx in [i for i in self._blocks if i not in window]:
+            freed += len(self._blocks.pop(idx))
+        if freed:
+            self._cached -= freed
+            _cache_release(freed)
         self._cond.notify_all()
 
 
@@ -585,6 +602,15 @@ def get_download(url: str) -> Download:
                 url, dl.total, PREFETCH_WORKERS,
                 f", edge {resolved}" if resolved != url else "",
             )
+        # If the budget is pinned by downloads nobody is reading (e.g. a
+        # cancelled install), shrink them to their resume window so this
+        # download gets room to prefetch.
+        if _total_cached >= MAX_CACHED_BYTES:
+            for other in _downloads.values():
+                if other is not dl:
+                    with other._cond:
+                        other._trim_idle_locked()
+            _malloc_trim()
         return dl
 
 
