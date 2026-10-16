@@ -164,6 +164,197 @@ def test_download_and_push():
             assert body["response"] == "-2135813882"
 
 
+def test_scenarios_endpoint_and_push():
+    """A multi-scenario PS5 pkg feeds the picker endpoint, and a chosen
+    scenario is handed to ezremote-dpi as a scenario_id URL parameter."""
+    import json
+    import socket
+    import threading
+    from tests.test_pkg import build_plgx, build_ps5_pkg
+
+    with tempfile.TemporaryDirectory() as root:
+        plgx = build_plgx([
+            ("sp-main", 3, [0, 1, 2, 5, 3, 4]),
+            ("sp-dlc1", 2, [0, 1, 5]),
+        ])
+        scen_json = json.dumps({
+            "scenarioDefaultId": 0, "scenarioDefaultLanguage": "en-US",
+            "scenarios": [
+                {"id": 0, "en-US": {"title": "Main Story", "description": "Play the story."}},
+                {"id": 1, "en-US": {"title": "Side Mode"}},
+            ],
+        }).encode("utf-8")
+        param = {"titleId": "PPSA03396",
+                 "localizedParameters": {"defaultLanguage": "en-US", "en-US": {"titleName": "Scen Game"}}}
+        img = build_ps5_pkg(param, extra_entries=[
+            (0x1001, plgx),
+            (0x3000, scen_json),
+            (0x3011, b"\x89PNG\r\n\x1a\nSC1"),  # only scenario 1 carries an image
+        ])
+        with open(os.path.join(root, "SCEN-PPSA03396.pkg"), "wb") as f:
+            f.write(img)
+        # A plain PS4 pkg with no scenario table.
+        with open(os.path.join(root, "PLAIN.pkg"), "wb") as f:
+            f.write(build_pkg({"TITLE": "Plain", "TITLE_ID": "CUSA77777", "VERSION": "01.00", "CATEGORY": "gd"}))
+
+        os.environ["PKG_DIRS"] = root
+        os.environ["ICON_DIR"] = os.path.join(root, "_icons")
+
+        import importlib
+        import app as app_module
+        importlib.reload(app_module)
+
+        from fastapi.testclient import TestClient
+
+        with TestClient(app_module.app) as client:
+            recs = client.get("/api/pkgs").json()["records"]
+            scen = next(x for x in recs if x["title"] == "Scen Game")
+            plain = next(x for x in recs if x["title"] == "Plain")
+
+            r = client.get(f"/api/pkg/{scen['id']}/scenarios")
+            assert r.status_code == 200
+            scenarios = r.json()["scenarios"]
+            assert [s["name"] for s in scenarios] == ["sp-main", "sp-dlc1"]
+            s0, s1 = scenarios
+            assert s0["title"] == "Main Story"
+            assert s0["description"] == "Play the story."
+            assert s0["default"] is True
+            assert (s0["initial_chunks"], s0["total_chunks"]) == (3, 6)
+            assert s0["image"] is None
+            assert s1["title"] == "Side Mode"
+            assert s1["image"] and s1["image"].startswith("/icons/")
+            img_resp = client.get(s1["image"])
+            assert img_resp.status_code == 200
+            assert img_resp.content == b"\x89PNG\r\n\x1a\nSC1"
+
+            # PS4 / no-table packages report no scenarios (push without asking).
+            assert client.get(f"/api/pkg/{plain['id']}/scenarios").json()["scenarios"] == []
+            assert client.get("/api/pkg/deadbeef/scenarios").status_code == 404
+
+            # Push with a scenario: the ezremote URL carries scenario_id.
+            received = {}
+            srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            srv.bind(("127.0.0.1", 0))
+            srv.listen(1)
+            port = srv.getsockname()[1]
+
+            def accept():
+                conn, _ = srv.accept()
+                data = b""
+                while b"\n" not in data:
+                    chunk = conn.recv(1024)
+                    if not chunk:
+                        break
+                    data += chunk
+                received["line"] = data.decode("utf-8").strip()
+                conn.sendall(b"0")
+                conn.close()
+
+            t = threading.Thread(target=accept)
+            t.start()
+
+            resp = client.post(
+                "/api/push",
+                json={"console_ip": "127.0.0.1", "console_port": port,
+                      "pkg_id": scen["id"], "scenario": 1},
+            )
+            t.join(timeout=5)
+            srv.close()
+
+            body = resp.json()
+            assert body["ok"] is True, body
+            assert body["code"] == 0
+            assert "scenario_id=1" in received["line"]
+
+            # An unknown scenario id is rejected before anything is sent.
+            resp = client.post(
+                "/api/push",
+                json={"console_ip": "127.0.0.1", "console_port": port,
+                      "pkg_id": scen["id"], "scenario": 9},
+            )
+            assert resp.status_code == 400
+
+            # etaHEN v1 takes the scenario as a playgo_scenario_id JSON field.
+            received.clear()
+            srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            srv.bind(("127.0.0.1", 0))
+            srv.listen(1)
+            port = srv.getsockname()[1]
+
+            def accept_v1():
+                conn, _ = srv.accept()
+                conn.settimeout(3)
+                data = b""
+                try:
+                    while True:
+                        chunk = conn.recv(1024)
+                        if not chunk:
+                            break
+                        data += chunk
+                        try:
+                            json.loads(data.decode("utf-8"))
+                            break  # got a complete object
+                        except ValueError:
+                            continue
+                except (OSError, socket.timeout):
+                    pass
+                received["data"] = data.decode("utf-8", "replace")
+                conn.sendall(b'{"res":"0"}')
+                conn.close()
+
+            t = threading.Thread(target=accept_v1)
+            t.start()
+
+            resp = client.post(
+                "/api/push",
+                json={"console_ip": "127.0.0.1", "console_port": port,
+                      "pkg_id": scen["id"], "protocol": "etahen_v1", "scenario": 1},
+            )
+            t.join(timeout=5)
+            srv.close()
+
+            assert resp.json()["ok"] is True
+            sent = json.loads(received["data"])
+            assert sent["playgo_scenario_id"] == "1"
+
+            # etaHEN v2 takes it as a playgo_scenario_id form field.
+            from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+            from urllib.parse import parse_qs
+
+            received.clear()
+
+            class Handler(BaseHTTPRequestHandler):
+                def do_POST(self):
+                    length = int(self.headers.get("Content-Length", 0))
+                    body = self.rfile.read(length).decode("utf-8")
+                    received["fields"] = {k: v[0] for k, v in parse_qs(body).items()}
+                    msg = b"SUCCESS: PKG installation started"
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(msg)))
+                    self.end_headers()
+                    self.wfile.write(msg)
+
+                def log_message(self, *a):  # silence
+                    pass
+
+            httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            port = httpd.server_address[1]
+            t = threading.Thread(target=httpd.handle_request)
+            t.start()
+
+            resp = client.post(
+                "/api/push",
+                json={"console_ip": "127.0.0.1", "console_port": port,
+                      "pkg_id": scen["id"], "protocol": "etahen_v2", "scenario": 0},
+            )
+            t.join(timeout=5)
+            httpd.server_close()
+
+            assert resp.json()["ok"] is True
+            assert received["fields"]["playgo_scenario_id"] == "0"
+
+
+
 def test_push_etahen_v1():
     """etaHEN DPI v1: server sends a JSON object over raw TCP, reads {"res":"N"}."""
     import json

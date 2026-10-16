@@ -256,7 +256,8 @@ def build_ps5_lih_pkg(param_obj, content_id="UP9000-PPSA06795_00-NPUG80135000000
 
 
 def build_ps5_pkg(param_obj, icon0=b"", content_id="UP4433-PPSA19639_00-CPREVIEW00000000",
-                  content_flags=0, signed=0x80, content_type=0x20, plaintext_noauth=False):
+                  content_flags=0, signed=0x80, content_type=0x20, plaintext_noauth=False,
+                  extra_entries=None):
     """Build a PS5 \\x7FFIH image wrapping a CNT with param.json (0x2000).
 
     Layout mirrors a real finalized image: FIH header region (0x10000), then the
@@ -267,12 +268,15 @@ def build_ps5_pkg(param_obj, icon0=b"", content_id="UP4433-PPSA19639_00-CPREVIEW
     content_type: 0x20 full app, 0x23 delta patch.
     plaintext_noauth: when True, stamp the PLAINTEXT_NOAUTH seed marker into the
         outer superblock (the fpkg signal); otherwise leave a stock seed.
+    extra_entries: additional (entry_id, bytes) records, e.g. playgo tables.
     """
     import json
 
     entries = [(0x2000, json.dumps(param_obj).encode("utf-8"))]
     if icon0:
         entries.append((0x1200, icon0))
+    for eid, data in (extra_entries or []):
+        entries.append((eid, data))
     cnt = build_cnt(entries, content_id, content_type=content_type, content_flags=content_flags)
 
     fih_region = 0x10000            # FIH header region
@@ -731,6 +735,179 @@ def test_kind_classification():
     assert classify_kind(None, 0x1E) == "Update"
     assert classify_kind(None, 0x1A) == "Game"
     assert classify_kind("", 0x99) == "Other"
+
+
+def build_plgx(scenarios, chunk_count=None):
+    """Build a synthetic PS5 playgo-chunk.dat (plgx).
+
+    scenarios: list of (name, initial, chunks) -- chunks is the ordered chunk
+    id list (not sorted, not necessarily 0..N-1); initial is how many leading
+    entries are needed before launch. Only sections 4/5/6 are populated.
+    """
+    if chunk_count is None:
+        chunk_count = max(c for _n, _i, chunks in scenarios for c in chunks) + 1
+
+    names = bytearray()
+    lists = bytearray()
+    entries = bytearray()
+    for name, initial, chunks in scenarios:
+        name_off = len(names)
+        names += name.encode("utf-8") + b"\x00"
+        list_off = len(lists)
+        lists += struct.pack(f"<{len(chunks)}H", *chunks)
+        entries += b"\x00" * 0x14
+        entries += struct.pack("<HHII", initial, len(chunks), list_off, name_off)
+
+    table_at = 0x100  # header + section table
+    lists_at = table_at + len(entries)
+    names_at = lists_at + len(lists)
+    total = names_at + len(names)
+
+    buf = bytearray(b"\x00" * total)
+    buf[0:4] = b"plgx"
+    struct.pack_into("<H", buf, 0x04, 0x1000)  # version
+    struct.pack_into("<H", buf, 0x0A, chunk_count)
+    struct.pack_into("<H", buf, 0x0E, len(scenarios))
+    struct.pack_into("<I", buf, 0x10, total)
+    # Section table at 0xC0: 7 x (offset, size); only 4/5/6 are used here.
+    struct.pack_into("<II", buf, 0xC0 + 4 * 8, table_at, len(entries))
+    struct.pack_into("<II", buf, 0xC0 + 5 * 8, lists_at, len(lists))
+    struct.pack_into("<II", buf, 0xC0 + 6 * 8, names_at, len(names))
+    buf[table_at:table_at + len(entries)] = entries
+    buf[lists_at:lists_at + len(lists)] = lists
+    buf[names_at:names_at + len(names)] = names
+    return bytes(buf)
+
+
+def test_playgo_scenarios_parse():
+    from pkgtool.pkg import parse_playgo_scenarios
+
+    # TLOU Part I layout: two scenarios, unsorted chunk lists, initial < total.
+    data = build_plgx([
+        ("sp-main", 3, [0, 1, 2, 5, 3, 4]),
+        ("sp-dlc1", 2, [0, 1, 5]),
+    ])
+    scenarios = parse_playgo_scenarios(data)
+    assert len(scenarios) == 2
+    s0, s1 = scenarios
+    assert (s0.id, s0.name, s0.initial, s0.total) == (0, "sp-main", 3, 6)
+    assert s0.chunks == [0, 1, 2, 5, 3, 4]  # list order preserved, not sorted
+    assert (s1.id, s1.name, s1.initial, s1.total) == (1, "sp-dlc1", 2, 3)
+    assert s0.to_dict()["chunks"] == [0, 1, 2, 5, 3, 4]
+
+
+def test_playgo_scenarios_malformed():
+    from pkgtool.pkg import parse_playgo_scenarios
+
+    for bad in (b"", b"\x00" * 0x200, b"plgx"):
+        try:
+            parse_playgo_scenarios(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"expected ValueError for {bad!r}")
+
+    # A scenario naming a chunk beyond the chunk count.
+    data = build_plgx([("sp-main", 1, [0, 7])], chunk_count=3)
+    try:
+        parse_playgo_scenarios(data)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("expected ValueError for out-of-range chunk id")
+
+    # initial > total is inconsistent.
+    data = build_plgx([("sp-main", 4, [0, 1])])
+    try:
+        parse_playgo_scenarios(data)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("expected ValueError for initial > total")
+
+
+def test_playgo_scenario_names():
+    import json
+    from pkgtool.pkg import parse_scenario_names
+
+    raw = json.dumps({
+        "scenarioCount": 2,
+        "scenarioDefaultId": 1,
+        "scenarioDefaultLanguage": "fr-FR",
+        "scenarios": [
+            {"id": 0, "type": "playmode",
+             "en-US": {"title": "Story", "description": "Main story."},
+             "fr-FR": {"title": "Histoire", "description": "L'histoire."}},
+            {"id": 1, "type": "playmode",
+             "fr-FR": {"title": "Sans retour"}},
+        ],
+    }).encode("utf-8")
+    names = parse_scenario_names(raw)
+    # en-US wins when present.
+    assert names[0] == {"title": "Story", "description": "Main story."}
+    # No en-US: the JSON's default language is used.
+    assert names[1] == {"title": "Sans retour", "default": True}
+
+    # Not JSON / wrong shape -> ValueError.
+    for bad in (b"not json", b"{}", b'{"scenarios": {}}'):
+        try:
+            parse_scenario_names(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"expected ValueError for {bad!r}")
+
+
+def test_pkg_playgo_scenarios():
+    import json
+
+    plgx = build_plgx([
+        ("sp-main", 3, [0, 1, 2, 5, 3, 4]),
+        ("sp-dlc1", 2, [0, 1, 5]),
+    ])
+    scen_json = json.dumps({
+        "scenarioDefaultId": 0, "scenarioDefaultLanguage": "en-US",
+        "scenarios": [
+            {"id": 0, "en-US": {"title": "The Game", "description": "Main story."}},
+            {"id": 1, "en-US": {"title": "Extras"}},
+        ],
+    }).encode("utf-8")
+    img = build_ps5_pkg({"titleId": "PPSA03396"}, extra_entries=[
+        (0x1001, plgx),
+        (0x3000, scen_json),
+        (0x3010, b"\x89PNG\r\n\x1a\nSC0"),
+        (0x3011, b"\x89PNG\r\n\x1a\nSC1"),
+    ])
+    with Pkg.from_source(BytesSource(img)) as pkg:
+        scenarios = pkg.playgo_scenarios()
+        assert [s.name for s in scenarios] == ["sp-main", "sp-dlc1"]
+        assert [(s.initial, s.total) for s in scenarios] == [(3, 6), (2, 3)]
+        names = pkg.playgo_scenario_names()
+        assert names[0]["title"] == "The Game"
+        assert names[1]["title"] == "Extras"
+        assert pkg.read_playgo_scenario_image(0) == b"\x89PNG\r\n\x1a\nSC0"
+        assert pkg.read_playgo_scenario_image(1) == b"\x89PNG\r\n\x1a\nSC1"
+        assert pkg.read_playgo_scenario_image(5) is None
+
+    # PS4 packages have no PlayGo scenarios.
+    with Pkg.from_source(BytesSource(build_pkg({"TITLE": "T", "TITLE_ID": "CUSA1"}))) as pkg:
+        assert pkg.playgo_scenarios() == []
+
+    # A PS5 package without a playgo table -> empty, not an error.
+    with Pkg.from_source(BytesSource(build_ps5_pkg({"titleId": "PPSA00001"}))) as pkg:
+        assert pkg.playgo_scenarios() == []
+        assert pkg.playgo_scenario_names() == {}
+
+
+def test_pkg_playgo_update_uses_app_chunk_dat():
+    # Updates read their scenario table from 0x1008 (app playgo-chunk.dat).
+    base_plgx = build_plgx([("sp-main", 3, [0, 1, 2, 5, 3, 4])])
+    app_plgx = build_plgx([("all", 1, [0, 1])])
+    img = build_ps5_pkg({"titleId": "PPSA00009"}, content_flags=0x41000000,
+                        extra_entries=[(0x1001, base_plgx), (0x1008, app_plgx)])
+    with Pkg.from_source(BytesSource(img)) as pkg:
+        assert pkg.kind == "Update"  # DELTA_PATCH flag pattern
+        assert [s.name for s in pkg.playgo_scenarios()] == ["all"]
 
 
 if __name__ == "__main__":

@@ -32,6 +32,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from pkgtool import ConcatSource
+from pkgtool import Pkg, PkgError
 from pkgtool import entitlements
 from pkgtool import proxy
 from pkgtool.scan import PkgRecord, ScanResult, scan, group_by_title_id
@@ -262,6 +263,11 @@ def _render_index(result: Optional[ScanResult]) -> str:
   .crow .cmain {{ min-width: 0; flex: 1 1 auto; }}
   .crow .cname {{ font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
   .crow .csub {{ font-size: 11px; color: #7c828a; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+  .scrow {{ align-items: flex-start; }}
+  .scrow img, .scrow .scnoimg {{ width: 64px; height: 64px; border-radius: 8px; object-fit: cover; background: #2a2e35; flex: 0 0 auto; }}
+  .scrow .cdesc {{ font-size: 11px; color: #9aa0a6; margin-top: 3px; }}
+  .scrow .scdefault {{ font-size: 10px; font-weight: 600; color: #5eead4; background: #134e4a; border-radius: 10px; padding: 1px 7px; margin-left: 6px; text-transform: uppercase; letter-spacing: .03em; }}
+  .schead {{ flex: 1 1 auto; min-width: 0; font-size: 14px; font-weight: 600; color: #e8eaed; align-self: center; }}
   .cnote {{ padding: 14px 12px; color: #7c828a; font-size: 12px; }}
   .csetup {{ padding: 14px 14px 18px; font-size: 12.5px; line-height: 1.55; color: #c4c8ce; }}
   .csetup h2 {{ font-size: 13px; margin: 0 0 8px; color: #e8eaed; }}
@@ -417,6 +423,15 @@ def _render_index(result: Optional[ScanResult]) -> str:
     <div id="cloudbody" class="sheetbody"></div>
   </div>
 </div>
+<div id="scenario" class="modal" hidden>
+  <div class="sheet" role="dialog" aria-modal="true" aria-label="Choose a scenario">
+    <div class="sheethead">
+      <div class="schead">This title has multiple PlayGo scenarios. Install which one first?</div>
+      <button class="btn close" onclick="scenarioClose('cancel')" aria-label="Close">&times;</button>
+    </div>
+    <div id="scbody" class="sheetbody"></div>
+  </div>
+</div>
 {body}
 <script>
 async function rescan(btn) {{
@@ -460,12 +475,14 @@ function getConsole() {{
   return {{ ip, port, proto }};
 }}
 
-async function doPush(id, ip, port, proto) {{
+async function doPush(id, ip, port, proto, scenario) {{
+  const payload = {{ console_ip: ip, console_port: port, pkg_id: id, protocol: proto }};
+  if (scenario !== null && scenario !== undefined) payload.scenario = scenario;
   try {{
     const r = await fetch('/api/push', {{
       method: 'POST',
       headers: {{ 'Content-Type': 'application/json' }},
-      body: JSON.stringify({{ console_ip: ip, console_port: port, pkg_id: id, protocol: proto }})
+      body: JSON.stringify(payload)
     }});
     return await r.json();
   }} catch (e) {{
@@ -793,12 +810,80 @@ async function cloudPush(pkg) {{
   }});
 }})();
 
+// --- scenario picker --------------------------------------------------------
+// A PS5 title with multiple PlayGo scenarios (e.g. a main story plus a side
+// mode) asks which one to install first; the choice goes to the DPI as
+// scenario_id. Packages with 0/1 scenarios skip the popup entirely.
+const scEl = () => document.getElementById('scenario');
+let scResolve = null;  // pending pickScenario promise resolve, while modal open
+
+function scenarioClose(result) {{
+  scEl().hidden = true;
+  if (scResolve) {{ const r = scResolve; scResolve = null; r(result); }}
+}}
+
+function scenarioRow(s) {{
+  const row = document.createElement('div');
+  row.className = 'crow scrow';
+  const img = document.createElement(s.image ? 'img' : 'div');
+  if (s.image) {{ img.src = s.image; img.alt = ''; }}
+  else {{ img.className = 'scnoimg'; }}
+  const main = document.createElement('div');
+  main.className = 'cmain';
+  const n = document.createElement('div'); n.className = 'cname';
+  n.textContent = s.title;
+  if (s.default) {{
+    const b = document.createElement('span');
+    b.className = 'scdefault'; b.textContent = 'default';
+    n.append(b);
+  }}
+  const sub = document.createElement('div'); sub.className = 'csub';
+  sub.textContent = (s.name && s.name !== s.title ? s.name + ' · ' : '')
+    + 'ready after ' + s.initial_chunks + ' of ' + s.total_chunks + ' chunks';
+  main.append(n, sub);
+  if (s.description) {{
+    const d = document.createElement('div'); d.className = 'cdesc';
+    d.textContent = s.description;
+    main.append(d);
+  }}
+  row.append(img, main);
+  row.addEventListener('click', () => scenarioClose(s.id));
+  return row;
+}}
+
+// Resolve with a scenario id, null (nothing to pick: <2 scenarios), or
+// 'cancel' (popup dismissed -- abort the push).
+async function pickScenario(id) {{
+  let list = [];
+  try {{
+    const j = await (await fetch('/api/pkg/' + encodeURIComponent(id) + '/scenarios')).json();
+    if (j.ok) list = j.scenarios;
+  }} catch (e) {{}}
+  if (list.length < 2) return null;
+  return new Promise(resolve => {{
+    scResolve = resolve;
+    const body = document.getElementById('scbody');
+    body.innerHTML = '';
+    for (const s of list) body.append(scenarioRow(s));
+    scEl().hidden = false;
+  }});
+}}
+
+(() => {{
+  scEl().addEventListener('click', ev => {{ if (ev.target === scEl()) scenarioClose('cancel'); }});
+  document.addEventListener('keydown', ev => {{
+    if (ev.key === 'Escape' && !scEl().hidden) scenarioClose('cancel');
+  }});
+}})();
+
 async function push(id, btn) {{
   const c = getConsole(); if (!c) return;
+  const scenario = await pickScenario(id);
+  if (scenario === 'cancel') return;
   const member = btn.closest('.member');
   const old = btn.innerHTML; btn.disabled = true; btn.innerHTML = '&hellip;';
   setStatus(member, 'pushing', 'Installing\u2026');
-  const j = await doPush(id, c.ip, c.port, c.proto);
+  const j = await doPush(id, c.ip, c.port, c.proto, scenario);
   const r = resultLabel(j);
   setStatus(member, r.state, r.text, r.title);
   btn.innerHTML = old; btn.disabled = false;
@@ -815,8 +900,13 @@ async function sendAll(ev, btn) {{
   for (let i = 0; i < members.length; i++) {{
     const m = members[i];
     btn.textContent = 'Installing ' + (i + 1) + '/' + members.length;
+    const scenario = await pickScenario(m.dataset.id);
+    if (scenario === 'cancel') {{
+      setStatus(m, '', '');
+      break;  // cancel aborts the rest of the batch
+    }}
     setStatus(m, 'pushing', 'Installing\u2026');
-    const j = await doPush(m.dataset.id, c.ip, c.port, c.proto);
+    const j = await doPush(m.dataset.id, c.ip, c.port, c.proto, scenario);
     const r = resultLabel(j);
     setStatus(m, r.state, r.text, r.title);
     if (i < members.length - 1) await sleep(PUSH_DELAY_MS);
@@ -892,6 +982,84 @@ def api_groups() -> JSONResponse:
 def api_rescan() -> JSONResponse:
     result = state.rescan()
     return JSONResponse({"total": result.total, "scanned_dirs": state.dirs})
+
+
+def _open_record(record: PkgRecord) -> Pkg:
+    """Open a scanned record as a Pkg (single file or split set)."""
+    parts = record.parts or [record.path]
+    if len(parts) > 1:
+        return Pkg.open_split([(p, os.path.getsize(p)) for p in parts])
+    return Pkg.open(parts[0])
+
+
+def _scenario_image(record: PkgRecord, pkg: Pkg, scenario_id: int) -> Optional[str]:
+    """Extract a scenario's PNG to the icon cache and return its /icons URL.
+
+    None when the package carries no image for that scenario (checked before
+    writing, so a package without images costs one entry lookup per request).
+    """
+    base = record.content_id or record.id
+    safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in base)
+    name = f"{safe}_sc{scenario_id}.png"
+    out = os.path.join(ICON_DIR, name)
+    if not os.path.exists(out):
+        try:
+            data = pkg.read_playgo_scenario_image(scenario_id)
+        except PkgError:
+            data = None
+        if not data:
+            return None
+        try:
+            with open(out, "wb") as f:
+                f.write(data)
+        except OSError:
+            return None
+    return f"/icons/{name}"
+
+
+def _read_scenarios(record: PkgRecord) -> List[Dict[str, object]]:
+    """PlayGo scenario list for a package; [] when there is nothing to pick."""
+    if record.platform != "PS5":
+        return []
+    try:
+        pkg = _open_record(record)
+    except (PkgError, OSError) as e:
+        logger.warning("scenarios: cannot open %s: %s", record.filename, e)
+        return []
+    with pkg:
+        try:
+            scenarios = pkg.playgo_scenarios()
+        except PkgError as e:
+            logger.warning("scenarios: %s: %s", record.filename, e)
+            return []
+        names = pkg.playgo_scenario_names()
+        return [
+            {
+                "id": s.id,
+                "name": s.name,
+                "title": names.get(s.id, {}).get("title") or s.name or f"Scenario #{s.id}",
+                "description": names.get(s.id, {}).get("description") or "",
+                "default": bool(names.get(s.id, {}).get("default")),
+                "initial_chunks": s.initial,
+                "total_chunks": s.total,
+                "image": _scenario_image(record, pkg, s.id),
+            }
+            for s in scenarios
+        ]
+
+
+@app.get("/api/pkg/{pkg_id}/scenarios")
+def api_pkg_scenarios(pkg_id: str) -> JSONResponse:
+    """PlayGo scenarios for a scanned package (PS5 only).
+
+    Drives the scenario picker shown before a push: a title with more than one
+    scenario (e.g. a main story plus a side mode) lets the user pick which one
+    installs first. An empty list means "push without asking".
+    """
+    record = state.index.get(pkg_id)
+    if record is None:
+        return JSONResponse({"ok": False, "error": "unknown package"}, status_code=404)
+    return JSONResponse({"ok": True, "scenarios": _read_scenarios(record)})
 
 
 @app.get("/download/{pkg_id}")
@@ -1110,6 +1278,7 @@ class PushRequest(BaseModel):
     console_port: int
     pkg_id: str
     protocol: str = "ezremote"
+    scenario: Optional[int] = None  # PlayGo scenario to install first
 
 
 @app.post("/api/push")
@@ -1119,6 +1288,10 @@ def api_push(req: PushRequest, request: Request) -> JSONResponse:
     Every supported protocol hands the console a ``/download/{id}`` URL that it
     fetches itself (with range support, so installs resume). They differ only in
     how the request is framed and how the reply is read -- see PUSH_PROTOCOLS.
+
+    ``scenario`` picks which PlayGo scenario installs first. ezremote-dpi takes
+    it as a ``scenario_id`` URL parameter; etaHEN (v1 and v2) takes it as a
+    ``playgo_scenario_id`` field. remote_pkg has no scenario support.
     """
     record = state.index.get(req.pkg_id)
     if record is None:
@@ -1138,6 +1311,17 @@ def api_push(req: PushRequest, request: Request) -> JSONResponse:
             status_code=400,
         )
 
+    scenario_id = ""
+    if req.scenario is not None and protocol != "remote_pkg":
+        # A scenario choice is only meaningful if the package declares it.
+        valid = {s["id"] for s in _read_scenarios(record)}
+        if req.scenario not in valid:
+            return JSONResponse(
+                {"ok": False, "error": f"unknown scenario {req.scenario}"},
+                status_code=400,
+            )
+        scenario_id = str(req.scenario)
+
     # Port the HTTP server is reachable on (as seen by this request).
     http_port = request.url.port or (443 if request.url.scheme == "https" else 80)
     authority, server_ip = _server_authority(req.console_ip, req.console_port, http_port)
@@ -1148,10 +1332,10 @@ def api_push(req: PushRequest, request: Request) -> JSONResponse:
     try:
         if protocol == "ezremote":
             # Metadata rides in the URL query string; icon stays relative.
-            params = urlencode(
-                {"content_id": record.content_id or "", "name": name, "icon": icon_rel}
-            )
-            url = f"http://{authority}/download/{req.pkg_id}?{params}"
+            params = {"content_id": record.content_id or "", "name": name, "icon": icon_rel}
+            if scenario_id:
+                params["scenario_id"] = scenario_id
+            url = f"http://{authority}/download/{req.pkg_id}?{urlencode(params)}"
             result = _push_ezremote(req.console_ip, req.console_port, url)
         elif protocol == "remote_pkg":
             # flatz installer takes an array of piece URLs; our /download/{id}
@@ -1169,6 +1353,8 @@ def api_push(req: PushRequest, request: Request) -> JSONResponse:
                 "content_name": name,
                 "icon_url": icon_abs,
             }
+            if scenario_id:
+                fields["playgo_scenario_id"] = scenario_id
             if protocol == "etahen_v2":
                 result = _push_etahen_v2(req.console_ip, req.console_port, fields)
             else:  # etahen / etahen_v1

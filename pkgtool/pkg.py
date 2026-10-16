@@ -29,7 +29,7 @@ import json
 import struct
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 
 # --- PKG constants -----------------------------------------------------------
@@ -102,6 +102,8 @@ ENTRY_PLAYGO_HASH_TABLE_DAT = 0x00002010  # PS5 playgo-hash-table.dat (always pr
 ENTRY_PLAYGO_FICM_DAT = 0x00002011        # PS5 playgo-ficm.dat (always present)
 ENTRY_PLAYGO_CHUNK_DAT = 0x00001001       # base game playgo-chunk.dat
 ENTRY_APP_PLAYGO_CHUNK_DAT = 0x00001008   # update/patch app playgo-chunk.dat
+ENTRY_PLAYGO_SCENARIO_JSON = 0x00003000   # PS5 playgo-scenario.json (titles/descriptions)
+ENTRY_PLAYGO_SCENARIO_PNG_BASE = 0x00003010  # PS5 playgo-scenarioNN.png: base + scenario id
 
 # PS4 "marriage" check (see hippie68/msum). content_flags & 0x0F000000 selects
 # which entry's DIGESTS-table digest identifies the base build a package binds
@@ -450,6 +452,44 @@ class Pkg:
 
     def read_icon0(self) -> Optional[bytes]:
         return self.read_entry(ENTRY_ICON0_PNG)
+
+    def _playgo_chunk_entry_id(self) -> int:
+        """playgo-chunk.dat entry to read: 0x1008 for an update, else 0x1001."""
+        if self.kind == "Update" and ENTRY_APP_PLAYGO_CHUNK_DAT in self.entries:
+            return ENTRY_APP_PLAYGO_CHUNK_DAT
+        return ENTRY_PLAYGO_CHUNK_DAT
+
+    def playgo_scenarios(self) -> List["Scenario"]:
+        """PS5 PlayGo scenarios from playgo-chunk.dat (``plgx``).
+
+        A scenario is an ordered chunk list whose leading ``initial`` chunks are
+        enough to launch the game. Returns [] for PS4 packages or packages
+        without a scenario table. Raises PkgError if the table is malformed.
+        """
+        if self.platform != "PS5":
+            return []
+        raw = self.read_entry(self._playgo_chunk_entry_id())
+        if raw is None:
+            return []
+        try:
+            return parse_playgo_scenarios(raw)
+        except ValueError as e:
+            raise PkgError(f"malformed playgo-chunk.dat: {e}") from e
+
+    def playgo_scenario_names(self) -> Dict[int, Dict[str, object]]:
+        """Display title/description per scenario id from playgo-scenario.json
+        (entry 0x3000). {} when the package doesn't carry one."""
+        raw = self.read_entry(ENTRY_PLAYGO_SCENARIO_JSON)
+        if raw is None:
+            return {}
+        try:
+            return parse_scenario_names(raw)
+        except ValueError:
+            return {}
+
+    def read_playgo_scenario_image(self, scenario_id: int) -> Optional[bytes]:
+        """The 1008x1008 PNG for a scenario (entry 0x3010 + id), or None."""
+        return self.read_entry(ENTRY_PLAYGO_SCENARIO_PNG_BASE + scenario_id)
 
     def marriage_digest(self) -> Optional[str]:
         """PS4 base<->update compatibility digest (see hippie68/msum).
@@ -1058,3 +1098,129 @@ def region_from_content_id(content_id: str) -> str:
         "K": "KR",
         "I": "INT",
     }.get(prefix, "Unknown")
+
+
+# --- PlayGo scenarios --------------------------------------------------------
+
+# The scenario tables in playgo-chunk.dat (entry 0x1001 for a base package,
+# 0x1008 for an update -- magic "plgx") say which chunks each scenario needs
+# and how many of those are required before the game can launch. The display
+# text (titles/descriptions per language) lives in playgo-scenario.json (entry
+# 0x3000); per-scenario images are entries 0x3010+N / 0x3050+N.
+#
+# All plgx fields are little-endian. Layout (checked against retail samples):
+#
+# * 0x0A u16 chunk count, 0x0E u16 scenario count
+# * 0xC0: 7 x (u32 offset, u32 size) section table
+# * section 4: scenario table, 0x20 bytes per scenario
+#   (+0x14 u16 initial chunk count, +0x16 u16 total chunk count,
+#    +0x18 u32 list offset into section 5, +0x1C u32 name offset into section 6)
+# * section 5: scenario chunk lists (u16 ids, ordered, first ``initial`` are
+#   required before launch -- the list is NOT sorted and NOT 0..N-1)
+# * section 6: scenario names, NUL-terminated strings (internal ids; the text
+#   the console shows lives in playgo-scenario.json)
+
+# plgx section indexes (of the 7-entry section table at 0xC0).
+_PLGX_SECTION_SCENARIO_TABLE = 4
+_PLGX_SECTION_SCENARIO_LISTS = 5
+_PLGX_SECTION_SCENARIO_NAMES = 6
+
+_PLGX_SCENARIO_ENTRY_SIZE = 0x20
+
+
+@dataclass
+class Scenario:
+    """One PlayGo scenario: which chunks it needs, and how many before launch."""
+
+    id: int  # index in the scenario table; matches playgo-scenario.json and the
+             # 0x3010+N / 0x3050+N image entries
+    name: str  # internal id from section 6 ("sp-main", "noreturn"); display text
+    initial: int  # leading entries of `chunks` needed before the game can launch
+    chunks: List[int]  # ordered chunk ids; NOT sorted, NOT necessarily 0..N-1
+
+    @property
+    def total(self) -> int:
+        return len(self.chunks)
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "initial": self.initial,
+            "total": self.total,
+            "chunks": list(self.chunks),
+        }
+
+
+def parse_playgo_scenarios(data: bytes) -> List[Scenario]:
+    """Scenarios from a PS5 playgo-chunk.dat ('plgx'); raises ValueError if malformed."""
+    if data[:4] != b"plgx" or len(data) < 0x100:
+        raise ValueError("not a plgx playgo-chunk.dat")
+    chunk_count, = struct.unpack_from("<H", data, 0x0A)
+    count, = struct.unpack_from("<H", data, 0x0E)
+    table_at, table_size = struct.unpack_from("<II", data, 0xC0 + _PLGX_SECTION_SCENARIO_TABLE * 8)
+    lists_at, lists_size = struct.unpack_from("<II", data, 0xC0 + _PLGX_SECTION_SCENARIO_LISTS * 8)
+    names_at, names_size = struct.unpack_from("<II", data, 0xC0 + _PLGX_SECTION_SCENARIO_NAMES * 8)
+    if table_size != count * _PLGX_SCENARIO_ENTRY_SIZE or max(
+        table_at + table_size, lists_at + lists_size, names_at + names_size
+    ) > len(data):
+        raise ValueError("scenario sections do not match the header")
+    out = []
+    for i in range(count):
+        entry = table_at + i * _PLGX_SCENARIO_ENTRY_SIZE
+        initial, total = struct.unpack_from("<HH", data, entry + 0x14)
+        list_off, name_off = struct.unpack_from("<II", data, entry + 0x18)
+        if initial > total or list_off + total * 2 > lists_size or name_off >= names_size:
+            raise ValueError(f"scenario {i} points outside its sections")
+        ids = list(struct.unpack_from(f"<{total}H", data, lists_at + list_off))
+        if any(c >= chunk_count for c in ids):
+            raise ValueError(f"scenario {i} names a chunk that does not exist")
+        end = data.index(b"\0", names_at + name_off, names_at + names_size)
+        out.append(Scenario(i, data[names_at + name_off:end].decode("utf-8"), initial, ids))
+    return out
+
+
+def parse_scenario_names(raw: bytes) -> Dict[int, Dict[str, object]]:
+    """Display text per scenario from playgo-scenario.json (entry 0x3000).
+
+    Returns ``{scenario_id: {"title": ..., "description": ...}}`` with an extra
+    ``"default": True`` on the JSON's ``scenarioDefaultId``. The display
+    language is picked as: en-US, then the JSON's ``scenarioDefaultLanguage``,
+    then any language the scenario carries. Raises ValueError if the blob is
+    not the expected JSON.
+    """
+    try:
+        doc = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as e:
+        raise ValueError(f"not playgo-scenario.json: {e}") from e
+    scenarios = doc.get("scenarios")
+    if not isinstance(scenarios, list):
+        raise ValueError("not playgo-scenario.json: missing scenarios list")
+
+    default_language = doc.get("scenarioDefaultLanguage")
+    if not isinstance(default_language, str):
+        default_language = ""
+    default_id = doc.get("scenarioDefaultId")
+
+    out: Dict[int, Dict[str, object]] = {}
+    for s in scenarios:
+        if not isinstance(s, dict) or not isinstance(s.get("id"), int):
+            continue
+        langs = {k: v for k, v in s.items() if isinstance(v, dict)}
+        pick = None
+        for lang in ("en-US", default_language):
+            if lang and isinstance(langs.get(lang), dict):
+                pick = langs[lang]
+                break
+        if pick is None and langs:
+            pick = next(iter(langs.values()))
+        info: Dict[str, object] = {}
+        if pick is not None:
+            for key in ("title", "description"):
+                value = pick.get(key)
+                if isinstance(value, str):
+                    info[key] = value
+        if default_id is not None and s["id"] == default_id:
+            info["default"] = True
+        out[s["id"]] = info
+    return out
