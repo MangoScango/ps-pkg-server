@@ -6,6 +6,8 @@ import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+# Starting the app runs console discovery; keep these tests off the real LAN.
+os.environ.setdefault("CONSOLE_SUBNET", "off")
 
 from tests.test_pkg import build_pkg  # noqa: E402
 from pkgtool.scan import scan, find_pkgs  # noqa: E402
@@ -265,6 +267,30 @@ def test_scenarios_endpoint_and_push():
             assert body["ok"] is True, body
             assert body["code"] == 0
             assert "scenario_id=1" in received["line"]
+            # PlayGo defaults on in the DPI, so it is not flagged when enabled.
+            assert "playgo" not in received["line"]
+
+            # PlayGo toggled off -> the URL carries playgo=0.
+            received.clear()
+            srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            srv.bind(("127.0.0.1", 0))
+            srv.listen(1)
+            port = srv.getsockname()[1]
+
+            t = threading.Thread(target=accept)
+            t.start()
+
+            resp = client.post(
+                "/api/push",
+                json={"console_ip": "127.0.0.1", "console_port": port,
+                      "pkg_id": scen["id"], "playgo": False},
+            )
+            t.join(timeout=5)
+            srv.close()
+
+            assert resp.json()["ok"] is True
+            assert "playgo=0" in received["line"]
+            assert "scenario_id" not in received["line"]
 
             # An unknown scenario id is rejected before anything is sent.
             resp = client.post(
@@ -1980,6 +2006,198 @@ def test_group_sources_sc_not_paired_across_directories():
             "UP0000-PPSA00001_00-APP0000000000000.pkg",
             "EP0000-PPSA00002_00-APP0000000000000_sc.pkg",
         }
+
+
+def _console_client(root, monkeypatch, subnet="off"):
+    """Reload the app with a private consoles file and return (module, client).
+
+    ``subnet`` is the CONSOLE_SUBNET setting. "off" keeps startup discovery from
+    touching the real network.
+    """
+    import importlib
+
+    monkeypatch.setenv("PKG_DIRS", root)
+    monkeypatch.setenv("ICON_DIR", os.path.join(root, "_icons"))
+    monkeypatch.setenv("CONSOLES_FILE", os.path.join(root, "consoles.json"))
+    monkeypatch.setenv("CONSOLE_SUBNET", subnet)
+
+    import app as app_module
+    importlib.reload(app_module)
+    from fastapi.testclient import TestClient
+    return app_module, TestClient(app_module.app)
+
+
+def _fake_console(host_id="EC748C02C215", ip="192.168.1.172", name="PS5-054", status="standby"):
+    from pkgtool.discovery import ConsoleInfo
+    return ConsoleInfo(host_id, ip, name, "PS5", "7.61", status, 1.0)
+
+
+def _wait_for_discovery(client):
+    import time
+
+    for _ in range(100):
+        j = client.get("/api/consoles").json()
+        if not j["discovering"]:
+            return j
+        time.sleep(0.05)
+    raise AssertionError("startup discovery never finished")
+
+
+def _stub_discover(app_module, monkeypatch, found=None, error=None):
+    """Replace discovery.discover; returns the list of subnets it was called with."""
+    calls = []
+
+    def fake(subnet=""):
+        calls.append(subnet)
+        if error:
+            raise error
+        return (found or []), "sweep"
+
+    monkeypatch.setattr(app_module.discovery, "discover", fake)
+    return calls
+
+
+def test_discovery_does_nothing_when_switched_off(monkeypatch):
+    with tempfile.TemporaryDirectory() as root:
+        app_module, client = _console_client(root, monkeypatch, subnet="off")
+        calls = _stub_discover(app_module, monkeypatch)
+        with client:
+            j = client.get("/api/consoles").json()
+        assert j == {
+            "ok": True, "consoles": [], "subnet": "", "discovering": False,
+            "discovery_method": "", "discovery_error": "",
+        }
+        assert calls == []
+
+
+def test_startup_discovery_saves_consoles_across_restarts(monkeypatch):
+    with tempfile.TemporaryDirectory() as root:
+        app_module, client = _console_client(root, monkeypatch, subnet="192.168.1.0/24")
+        calls = _stub_discover(app_module, monkeypatch, found=[_fake_console()])
+        with client:
+            j = _wait_for_discovery(client)
+        assert calls == ["192.168.1.0/24"]
+        assert [c["name"] for c in j["consoles"]] == ["PS5-054"]
+        assert (j["subnet"], j["discovery_method"]) == ("192.168.1.0/24", "sweep")
+
+        # A restart with discovery off still has the console, from disk.
+        app_module, client = _console_client(root, monkeypatch)
+        with client:
+            assert [c["ip"] for c in client.get("/api/consoles").json()["consoles"]] == ["192.168.1.172"]
+
+
+def test_native_run_falls_back_to_its_own_subnet(monkeypatch):
+    with tempfile.TemporaryDirectory() as root:
+        app_module, client = _console_client(root, monkeypatch, subnet="")
+        monkeypatch.setattr(app_module, "IN_CONTAINER", False)
+        monkeypatch.setattr(app_module.discovery, "local_subnet", lambda: "10.1.2.0/24")
+        calls = _stub_discover(app_module, monkeypatch)
+        with client:
+            j = _wait_for_discovery(client)
+        assert calls == ["10.1.2.0/24"]
+        assert j["subnet"] == "10.1.2.0/24"
+
+
+def test_container_without_a_subnet_still_broadcasts(monkeypatch):
+    def no_route():
+        raise AssertionError("a container cannot see the LAN's subnet")
+
+    with tempfile.TemporaryDirectory() as root:
+        app_module, client = _console_client(root, monkeypatch, subnet="")
+        monkeypatch.setattr(app_module, "IN_CONTAINER", True)
+        monkeypatch.setattr(app_module.discovery, "local_subnet", no_route)
+        calls = _stub_discover(app_module, monkeypatch)
+        with client:
+            j = _wait_for_discovery(client)
+        assert calls == [""]
+        assert j["subnet"] == ""
+
+
+def test_configured_subnet_beats_the_container_default(monkeypatch):
+    with tempfile.TemporaryDirectory() as root:
+        app_module, client = _console_client(root, monkeypatch, subnet="192.168.7.0/24")
+        monkeypatch.setattr(app_module, "IN_CONTAINER", True)
+        calls = _stub_discover(app_module, monkeypatch)
+        with client:
+            _wait_for_discovery(client)
+        assert calls == ["192.168.7.0/24"]
+
+
+def test_a_failed_discovery_is_reported_not_raised(monkeypatch):
+    with tempfile.TemporaryDirectory() as root:
+        app_module, client = _console_client(root, monkeypatch, subnet="192.168.0.0/16")
+        _stub_discover(
+            app_module, monkeypatch,
+            error=ValueError("192.168.0.0/16 has 65536 addresses; the limit is 1024"),
+        )
+        with client:
+            j = _wait_for_discovery(client)
+            assert client.get("/").status_code == 200
+        assert "limit is 1024" in j["discovery_error"]
+        assert j["consoles"] == []
+
+
+def test_probe_returns_status_and_saves_the_console(monkeypatch):
+    canned = {
+        "console": _fake_console().to_dict(),
+        "ports": {"9040": False, "9090": False, "12800": True},
+        "dpi": [{"protocol": "etahen_v2", "port": 12800}],
+        "suggested": {"protocol": "etahen_v2", "port": 12800},
+    }
+    seen = []
+    with tempfile.TemporaryDirectory() as root:
+        app_module, client = _console_client(root, monkeypatch)
+        monkeypatch.setattr(app_module.discovery, "inspect", lambda ip, port=None: seen.append((ip, port)) or canned)
+        with client:
+            j = client.post("/api/consoles/probe", json={"ip": " 192.168.1.172 ", "port": 9040}).json()
+            assert j["ok"] is True
+            assert j["suggested"] == {"protocol": "etahen_v2", "port": 12800}
+            assert j["console"]["firmware"] == "7.61"
+            assert seen == [("192.168.1.172", 9040)]
+            assert [c["name"] for c in client.get("/api/consoles").json()["consoles"]] == ["PS5-054"]
+
+
+def test_probe_of_a_silent_address_saves_nothing(monkeypatch):
+    canned = {"console": None, "ports": {"9040": False}, "dpi": [], "suggested": None}
+    with tempfile.TemporaryDirectory() as root:
+        app_module, client = _console_client(root, monkeypatch)
+        monkeypatch.setattr(app_module.discovery, "inspect", lambda ip, port=None: canned)
+        with client:
+            j = client.post("/api/consoles/probe", json={"ip": "192.168.1.99"}).json()
+            assert j["ok"] is True and j["console"] is None
+            assert client.get("/api/consoles").json()["consoles"] == []
+
+
+def test_probe_only_accepts_private_ipv4_addresses(monkeypatch):
+    with tempfile.TemporaryDirectory() as root:
+        app_module, client = _console_client(root, monkeypatch)
+        calls = []
+        monkeypatch.setattr(app_module.discovery, "inspect", lambda ip, port=None: calls.append(ip))
+        with client:
+            for bad in ("8.8.8.8", "127.0.0.1", "169.254.169.254", "example.com", "", "::1",
+                        "192.168.1.1; rm -rf /", "999.1.1.1", "1.1.1.1", "0.0.0.0",
+                        "255.255.255.255", "100.64.0.1", "172.32.0.1", "224.0.0.1"):
+                r = client.post("/api/consoles/probe", json={"ip": bad})
+                assert r.status_code == 400, bad
+                assert r.json()["ok"] is False
+            assert calls == []
+            # The edges of the allowed ranges are inside them.
+            monkeypatch.setattr(
+                app_module.discovery, "inspect",
+                lambda ip, port=None: {"console": None, "ports": {}, "dpi": [], "suggested": None},
+            )
+            for good in ("10.0.0.1", "172.16.0.1", "172.31.255.254", "192.168.255.254"):
+                assert client.post("/api/consoles/probe", json={"ip": good}).status_code == 200, good
+
+
+def test_index_has_the_console_picker(monkeypatch):
+    with tempfile.TemporaryDirectory() as root:
+        app_module, client = _console_client(root, monkeypatch)
+        with client:
+            page = client.get("/").text
+        assert 'id="cip"' in page and 'role="combobox"' in page
+        assert 'id="clist"' in page and 'role="listbox"' in page
+        assert "/api/consoles/probe" in page
 
 
 if __name__ == "__main__":

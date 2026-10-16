@@ -22,6 +22,8 @@ Then open http://localhost:8000.
 | `SCAN_WORKERS` | Parallel parse workers | `8` |
 | `PUBLIC_HOST` | Force the `host:port` the console downloads from | auto-detect |
 | `ENTITLEMENTS_CSV` | Entitlement catalogue for cloud install | `entitlements_all.csv` |
+| `CONSOLE_SUBNET` | Subnet swept for consoles when the startup broadcast finds none, e.g. `192.168.1.0/24` (max 1024 addresses). `off` disables discovery | the host's own /24 when not in a container |
+| `CONSOLES_FILE` | Where discovered consoles are saved | `consoles.json` next to the icon cache |
 
 - Icons and other runtime data persist in `./data` (mounted at `/data`).
 - Add more libraries by adding `:ro` volumes in `docker-compose.yml` and listing

@@ -13,11 +13,13 @@ Run:
 from __future__ import annotations
 
 import html
+import ipaddress
 import json
 import logging
 import os
 import re
 import socket
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -33,6 +35,7 @@ from pydantic import BaseModel
 
 from pkgtool import ConcatSource
 from pkgtool import Pkg, PkgError
+from pkgtool import discovery
 from pkgtool import entitlements
 from pkgtool import proxy
 from pkgtool.scan import PkgRecord, ScanResult, scan, group_by_title_id
@@ -52,6 +55,14 @@ ENTITLEMENTS_CSV = os.environ.get("ENTITLEMENTS_CSV", "entitlements_all.csv")
 ENTITLEMENTS_SOURCE_URL = "https://garlicsaves.com/tools/entitlements"
 IN_CONTAINER = os.path.exists("/.dockerenv")
 ENTITLEMENTS_MAX_UPLOAD = 64 * 1024 * 1024
+# Startup discovery broadcasts for consoles and, if nothing answers, sweeps this
+# subnet (e.g. 192.168.1.0/24). A bridged container cannot see the LAN's subnet,
+# so it has to be named here; outside a container it defaults to the host's own
+# /24. "off" disables discovery entirely.
+CONSOLE_SUBNET = os.environ.get("CONSOLE_SUBNET", "").strip()
+CONSOLES_FILE = os.environ.get(
+    "CONSOLES_FILE", os.path.join(os.path.dirname(os.path.abspath(ICON_DIR)), "consoles.json")
+)
 
 
 def _configured_dirs() -> List[str]:
@@ -67,6 +78,11 @@ class AppState:
         self.result: Optional[ScanResult] = None
         self.index: Dict[str, PkgRecord] = {}
         self._entitlements: Optional[List[entitlements.Entitlement]] = None
+        self.consoles = discovery.ConsoleStore(CONSOLES_FILE)
+        self.subnet = ""  # swept when a broadcast finds nothing; empty = never sweep
+        self.discovering = False
+        self.discovery_method = ""  # "broadcast" or "sweep", once a run has finished
+        self.discovery_error = ""
 
     @property
     def entitlements(self) -> List[entitlements.Entitlement]:
@@ -77,6 +93,21 @@ class AppState:
     def reload_entitlements(self) -> List[entitlements.Entitlement]:
         self._entitlements = None
         return self.entitlements
+
+    def discover_consoles(self) -> None:
+        """Broadcast for consoles, sweeping the subnet if that finds none, and
+        save whatever answers. Never raises."""
+        self.discovering, self.discovery_error = True, ""
+        try:
+            found, method = discovery.discover(self.subnet)
+            self.consoles.upsert(found)
+            self.discovery_method = method
+            logger.info("console discovery (%s) found %d console(s)", method, len(found))
+        except (ValueError, OSError) as e:
+            self.discovery_error = str(e)
+            logger.warning("console discovery failed: %s", e)
+        finally:
+            self.discovering = False
 
     def rescan(self) -> ScanResult:
         self.result = scan(self.dirs, icon_dir=ICON_DIR, workers=SCAN_WORKERS)
@@ -89,9 +120,21 @@ class AppState:
 state = AppState()
 
 
+def _console_fallback_subnet() -> str:
+    """The subnet to sweep when a broadcast finds nothing, or "" for none."""
+    if CONSOLE_SUBNET and CONSOLE_SUBNET.lower() != "off":
+        return CONSOLE_SUBNET
+    return "" if IN_CONTAINER else (discovery.local_subnet() or "")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     os.makedirs(ICON_DIR, exist_ok=True)
+    if CONSOLE_SUBNET.lower() != "off":
+        state.subnet = _console_fallback_subnet()
+        # Off the startup path: discovery waits a few seconds for replies.
+        state.discovering = True
+        threading.Thread(target=state.discover_consoles, daemon=True, name="console-discovery").start()
     if state.dirs:
         state.rescan()
     yield
@@ -325,6 +368,19 @@ def _render_index(result: Optional[ScanResult]) -> str:
   .console select {{ cursor: pointer; max-width: 100%; }}
   .console #cip {{ width: 130px; }}
   .console #cport {{ width: 72px; }}
+  .combo {{ position: relative; flex: 0 0 auto; }}
+  .clist {{ position: absolute; top: calc(100% + 4px); left: 0; z-index: 20; margin: 0; padding: 4px; list-style: none; min-width: min(340px, 92vw); max-height: 50vh; overflow-y: auto; background: #1a1d22; border: 1px solid #2a2e35; border-radius: 10px; box-shadow: 0 10px 30px rgba(0,0,0,.5); }}
+  .copt {{ display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-radius: 7px; cursor: pointer; font-size: 13px; }}
+  .copt[aria-selected="true"], .copt:hover {{ background: #262b33; }}
+  .copt .cdot {{ width: 8px; height: 8px; border-radius: 50%; flex: 0 0 auto; background: #6b7280; }}
+  .copt .cdot.awake {{ background: #34d399; }}
+  .copt .cdot.standby {{ background: #f59e0b; }}
+  .copt .cmain {{ min-width: 0; flex: 1; }}
+  .copt .cip {{ font-variant-numeric: tabular-nums; }}
+  .copt .cname {{ color: #c4c8ce; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+  .copt .cfw {{ color: #9aa0a6; font-size: 12px; flex: 0 0 auto; font-variant-numeric: tabular-nums; }}
+  .consoletoggle {{ display: flex; align-items: center; gap: 5px; font-size: 12px; color: #c4c8ce; white-space: nowrap; cursor: pointer; flex: 0 0 auto; user-select: none; }}
+  .consoletoggle input {{ accent-color: #3b82f6; cursor: pointer; }}
   .badge {{ font-size: 10px; font-weight: 600; padding: 2px 7px; border-radius: 10px; white-space: nowrap; text-transform: uppercase; letter-spacing: .03em; background: #374151; color: #d1d5db; }}
   .badge.kind-game {{ background: #14532d; color: #86efac; }}
   .badge.kind-update {{ background: #1e3a5f; color: #93c5fd; }}
@@ -347,12 +403,17 @@ def _render_index(result: Optional[ScanResult]) -> str:
      the IP field grows to fill, and the group padding tightens. */
   @media (max-width: 600px) {{
     .hright {{ width: 100%; margin-left: 0; flex-wrap: wrap; }}
-    /* Stack the console: protocol on its own row, IP + port share the next.
-       Keeps the wide protocol <select> from forcing horizontal scroll. */
+    /* Stack the console: protocol on its own row, IP + port + PlayGo share the
+       next. Keeps the wide protocol <select> from forcing horizontal scroll. */
     .console {{ flex: 1 1 100%; flex-wrap: wrap; }}
     .console select {{ flex: 1 1 100%; }}
-    .console #cip {{ flex: 1 1 120px; width: auto; }}
-    .console #cport {{ flex: 0 0 80px; width: auto; }}
+    .console .combo {{ flex: 1 1 120px; }}
+    .console #cip {{ width: 100%; box-sizing: border-box; }}
+    .console #cport {{ flex: 0 0 72px; width: auto; }}
+    .console .consoletoggle {{ height: 38px; }}
+    /* Cloud + Rescan share the last row, with Rescan filling the leftover
+       space instead of leaving a dead gap. */
+    .rescan {{ flex: 1 1 auto; }}
     .groups {{ padding: 12px 12px 24px; }}
     .group summary {{ gap: 10px; padding: 10px; }}
     .icon img, .icon .noicon {{ width: 56px; height: 56px; }}
@@ -399,8 +460,15 @@ def _render_index(result: Optional[ScanResult]) -> str:
         <option value="etahen_v2">etaHEN DPI v2</option>
         <option value="remote_pkg">PS4 Remote PKG Installer</option>
       </select>
-      <input id="cip" placeholder="Console IP" autocomplete="off" inputmode="decimal">
+      <div class="combo">
+        <input id="cip" placeholder="Console IP" autocomplete="off" inputmode="decimal" spellcheck="false"
+               role="combobox" aria-expanded="false" aria-controls="clist" aria-autocomplete="list" aria-label="Console IP address">
+        <ul id="clist" class="clist" role="listbox" aria-label="Saved consoles" hidden></ul>
+      </div>
       <input id="cport" placeholder="Port" value="9040" autocomplete="off" inputmode="numeric">
+      <label class="consoletoggle" title="Install with PlayGo: chunks are prioritized so games can launch before the download finishes. Only ezremote-dpi supports this; etaHEN and the PS4 remote installer ignore it.">
+        <input type="checkbox" id="cplaygo" checked> PlayGo
+      </label>
     </div>
     <button class="cloudbtn" onclick="cloudOpen()" title="Install from the cloud" aria-label="Install from the cloud"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 10h-1.26A8 8 0 1 0 9 20h9a5 5 0 0 0 0-10z"/></svg></button>
     <button class="rescan" onclick="rescan(this)">Rescan</button>
@@ -447,6 +515,13 @@ async function rescan(btn) {{
   if (saved) el.value = saved;
   el.addEventListener('change', () => localStorage.setItem(key, el.value));
 }});
+// PlayGo toggle: on by default (the DPI's own default), persisted.
+(() => {{
+  const el = document.getElementById('cplaygo');
+  const key = 'pkgserver_cplaygo';
+  el.checked = localStorage.getItem(key) !== '0';
+  el.addEventListener('change', () => localStorage.setItem(key, el.checked ? '1' : '0'));
+}})();
 
 // Default listen ports per protocol. Switching protocol updates the port only
 // when the user hasn't set a custom one (empty or still a known default).
@@ -464,6 +539,132 @@ const PROTO_PORTS = {{ ezremote: 9040, etahen_v1: 9090, etahen_v2: 12800, remote
   }});
 }})();
 
+// Console picker: every known console in a dropdown, any address typeable.
+// Choosing one, or finishing a valid IPv4 address, probes the console and, when
+// a known DPI server is listening, switches the protocol and port to match.
+(() => {{
+  const ip = document.getElementById('cip');
+  const port = document.getElementById('cport');
+  const proto = document.getElementById('cproto');
+  const list = document.getElementById('clist');
+  const IPV4 = /^(25[0-5]|2[0-4]\\d|1?\\d?\\d)(\\.(25[0-5]|2[0-4]\\d|1?\\d?\\d)){{3}}$/;
+  let saved = [], active = -1, timer = null, seq = 0;
+
+  function render() {{
+    list.replaceChildren();
+    const current = ip.value.trim();
+    active = saved.findIndex(c => c.ip === current);
+    saved.forEach((c, i) => {{
+      const li = document.createElement('li');
+      li.className = 'copt'; li.id = 'copt' + i;
+      li.setAttribute('role', 'option'); li.setAttribute('aria-selected', i === active ? 'true' : 'false');
+      const awake = c.status === 'awake';
+      li.setAttribute('aria-label', [c.ip, c.name, c.firmware && 'firmware ' + c.firmware, awake ? 'on' : 'rest mode'].filter(Boolean).join(', '));
+      const dot = document.createElement('span');
+      dot.className = 'cdot ' + (awake ? 'awake' : 'standby'); dot.title = awake ? 'On' : 'Rest mode';
+      const main = document.createElement('div'); main.className = 'cmain';
+      const addr = document.createElement('div'); addr.className = 'cip'; addr.textContent = c.ip;
+      const name = document.createElement('div'); name.className = 'cname'; name.textContent = c.name;
+      main.append(addr, name);
+      const fw = document.createElement('span'); fw.className = 'cfw'; fw.textContent = c.firmware ? 'FW ' + c.firmware : '';
+      li.append(dot, main, fw);
+      // mousedown, not click: the input must keep focus or blur closes the list first.
+      li.addEventListener('mousedown', ev => {{ ev.preventDefault(); choose(c); }});
+      list.append(li);
+    }});
+    if (active >= 0) ip.setAttribute('aria-activedescendant', 'copt' + active);
+    else ip.removeAttribute('aria-activedescendant');
+  }}
+
+  function openList() {{
+    if (!saved.length) return;
+    render();
+    list.hidden = false; ip.setAttribute('aria-expanded', 'true');
+  }}
+  function closeList() {{ list.hidden = true; ip.setAttribute('aria-expanded', 'false'); }}
+
+  function setActive(i) {{
+    list.querySelectorAll('.copt').forEach((el, n) => el.setAttribute('aria-selected', n === i ? 'true' : 'false'));
+    active = i;
+    ip.setAttribute('aria-activedescendant', 'copt' + i);
+    const el = document.getElementById('copt' + i);
+    if (el) el.scrollIntoView({{ block: 'nearest' }});
+  }}
+
+  function choose(c) {{
+    ip.value = c.ip;
+    localStorage.setItem('pkgserver_cip', c.ip);
+    closeList();
+    probe();
+  }}
+
+  function scheduleProbe(ms) {{
+    clearTimeout(timer);
+    if (IPV4.test(ip.value.trim())) timer = setTimeout(probe, ms);
+  }}
+
+  async function probe() {{
+    clearTimeout(timer);
+    const addr = ip.value.trim();
+    if (!IPV4.test(addr)) return;
+    const mine = ++seq;
+    let j;
+    try {{
+      const r = await fetch('/api/consoles/probe', {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify({{ ip: addr, port: parseInt(port.value, 10) || null }})
+      }});
+      j = await r.json();
+    }} catch (e) {{
+      return;
+    }}
+    // A newer probe, or an edit to the address, makes this answer stale.
+    if (!j.ok || mine !== seq || ip.value.trim() !== addr) return;
+    if (j.suggested) {{
+      proto.value = j.suggested.protocol;
+      port.value = j.suggested.port;
+      localStorage.setItem('pkgserver_cproto', proto.value);
+      localStorage.setItem('pkgserver_cport', port.value);
+    }}
+    if (j.console) loadSaved();
+  }}
+
+  async function loadSaved() {{
+    try {{
+      const j = await (await fetch('/api/consoles')).json();
+      const hadNone = !saved.length;
+      saved = j.consoles || [];
+      if (!list.hidden) openList();
+      // Discovery finished while the user was already in the field.
+      else if (hadNone && saved.length && document.activeElement === ip) openList();
+      if (j.discovering) setTimeout(loadSaved, 2000);  // pick up what startup discovery finds
+    }} catch (e) {{ /* the picker still works with typed addresses */ }}
+  }}
+
+  ip.addEventListener('focus', openList);
+  ip.addEventListener('click', openList);
+  ip.addEventListener('blur', closeList);
+  ip.addEventListener('input', () => {{ openList(); scheduleProbe(600); }});
+  ip.addEventListener('keydown', ev => {{
+    if (ev.key === 'ArrowDown' || ev.key === 'ArrowUp') {{
+      if (list.hidden) openList();
+      if (!saved.length) return;
+      ev.preventDefault();
+      const last = saved.length - 1;
+      setActive(ev.key === 'ArrowDown' ? (active >= last ? 0 : active + 1) : (active <= 0 ? last : active - 1));
+    }} else if (ev.key === 'Enter') {{
+      if (!list.hidden && active >= 0) {{ ev.preventDefault(); choose(saved[active]); }}
+      else probe();
+    }} else if (ev.key === 'Escape') {{
+      closeList();
+    }}
+  }});
+
+  loadSaved();
+  if (IPV4.test(ip.value.trim())) probe();
+}})();
+
 const PUSH_DELAY_MS = 1000;  // gap AFTER the console responds, before the next push
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
@@ -471,13 +672,16 @@ function getConsole() {{
   const ip = document.getElementById('cip').value.trim();
   const port = parseInt(document.getElementById('cport').value, 10);
   const proto = document.getElementById('cproto').value;
+  const playgo = document.getElementById('cplaygo').checked;
   if (!ip || !port) {{ alert('Enter the console IP and port first.'); return null; }}
-  return {{ ip, port, proto }};
+  return {{ ip, port, proto, playgo }};
 }}
 
-async function doPush(id, ip, port, proto, scenario) {{
+async function doPush(id, ip, port, proto, scenario, playgo) {{
   const payload = {{ console_ip: ip, console_port: port, pkg_id: id, protocol: proto }};
   if (scenario !== null && scenario !== undefined) payload.scenario = scenario;
+  // Only sent when off -- "on" is the DPI's default, so it needs no flag.
+  if (playgo === false) payload.playgo = false;
   try {{
     const r = await fetch('/api/push', {{
       method: 'POST',
@@ -763,17 +967,19 @@ async function cloudResolve(payload) {{
 async function cloudPush(pkg) {{
   const c = getConsole(); if (!c) return;
   cloudNote('Installing ' + (pkg.title || pkg.name || pkg.content_id) + '\u2026');
+  const payload = {{
+    console_ip: c.ip, console_port: c.port, protocol: c.proto,
+    manifest_url: pkg.manifest_url, content_id: pkg.content_id,
+    name: pkg.name || '', title: pkg.title || '',
+    proxy: document.getElementById('cloudproxy').checked
+  }};
+  if (!c.playgo) payload.playgo = false;  // only sent when off; on is the DPI default
   let j;
   try {{
     const r = await fetch('/api/cloud/push', {{
       method: 'POST',
       headers: {{ 'Content-Type': 'application/json' }},
-      body: JSON.stringify({{
-        console_ip: c.ip, console_port: c.port, protocol: c.proto,
-        manifest_url: pkg.manifest_url, content_id: pkg.content_id,
-        name: pkg.name || '', title: pkg.title || '',
-        proxy: document.getElementById('cloudproxy').checked
-      }})
+      body: JSON.stringify(payload)
     }});
     j = await r.json();
   }} catch (e) {{ j = {{ ok: false, error: String(e) }}; }}
@@ -883,7 +1089,7 @@ async function push(id, btn) {{
   const member = btn.closest('.member');
   const old = btn.innerHTML; btn.disabled = true; btn.innerHTML = '&hellip;';
   setStatus(member, 'pushing', 'Installing\u2026');
-  const j = await doPush(id, c.ip, c.port, c.proto, scenario);
+  const j = await doPush(id, c.ip, c.port, c.proto, scenario, c.playgo);
   const r = resultLabel(j);
   setStatus(member, r.state, r.text, r.title);
   btn.innerHTML = old; btn.disabled = false;
@@ -906,7 +1112,7 @@ async function sendAll(ev, btn) {{
       break;  // cancel aborts the rest of the batch
     }}
     setStatus(m, 'pushing', 'Installing\u2026');
-    const j = await doPush(m.dataset.id, c.ip, c.port, c.proto, scenario);
+    const j = await doPush(m.dataset.id, c.ip, c.port, c.proto, scenario, c.playgo);
     const r = resultLabel(j);
     setStatus(m, r.state, r.text, r.title);
     if (i < members.length - 1) await sleep(PUSH_DELAY_MS);
@@ -1255,6 +1461,47 @@ def proxy_cdn(token: str, request: Request, filename: str = ""):
     return StreamingResponse(body(), status_code=status, headers=headers)
 
 
+@app.get("/api/consoles")
+def api_consoles() -> JSONResponse:
+    """Consoles found by the startup sweep or by earlier probes."""
+    return JSONResponse(
+        {
+            "ok": True,
+            "consoles": [c.to_dict() for c in state.consoles.all()],
+            "subnet": state.subnet,
+            "discovering": state.discovering,
+            "discovery_method": state.discovery_method,
+            "discovery_error": state.discovery_error,
+        }
+    )
+
+
+class ProbeRequest(BaseModel):
+    ip: str
+    port: Optional[int] = None
+
+
+@app.post("/api/consoles/probe")
+def api_consoles_probe(req: ProbeRequest) -> JSONResponse:
+    """Ask one console for its status and see which DPI servers are listening.
+
+    The address must fall in an RFC1918 range, so this cannot be pointed at hosts
+    outside the LAN. A console that answers is remembered for the picker.
+    """
+    ip = req.ip.strip()
+    try:
+        ipaddress.IPv4Address(ip)
+    except ValueError:
+        return JSONResponse({"ok": False, "error": "not an IPv4 address"}, status_code=400)
+    if not discovery.is_lan_address(ip):
+        return JSONResponse({"ok": False, "error": "address is not a LAN address"}, status_code=400)
+    port = req.port if req.port and 0 < req.port < 65536 else None
+    result = discovery.inspect(ip, port)
+    if result["console"]:
+        state.consoles.upsert([discovery.ConsoleInfo(**result["console"])])
+    return JSONResponse({"ok": True, **result})
+
+
 # Supported console push protocols. "ezremote" is the original MangoScango/
 # ps5-ezremote-dpi dialect (raw TCP, plain URL line, bare-integer reply).
 # "etahen"/"etahen_v1" and "etahen_v2" target etaHEN's DirectPKGInstaller:
@@ -1273,12 +1520,14 @@ PUSH_PROTOCOLS = (
 )
 
 
+
 class PushRequest(BaseModel):
     console_ip: str
     console_port: int
     pkg_id: str
     protocol: str = "ezremote"
     scenario: Optional[int] = None  # PlayGo scenario to install first
+    playgo: Optional[bool] = None  # False = explicitly disable PlayGo (ezremote)
 
 
 @app.post("/api/push")
@@ -1332,7 +1581,11 @@ def api_push(req: PushRequest, request: Request) -> JSONResponse:
     try:
         if protocol == "ezremote":
             # Metadata rides in the URL query string; icon stays relative.
+            # PlayGo is only flagged when the user turned it off -- enabled is
+            # the DPI's default, so it needs no flag.
             params = {"content_id": record.content_id or "", "name": name, "icon": icon_rel}
+            if req.playgo is False:
+                params["playgo"] = "0"
             if scenario_id:
                 params["scenario_id"] = scenario_id
             url = f"http://{authority}/download/{req.pkg_id}?{urlencode(params)}"
@@ -1547,6 +1800,7 @@ class CloudPushRequest(BaseModel):
     title: str = ""
     protocol: str = "ezremote"
     proxy: bool = False
+    playgo: Optional[bool] = None  # False = explicitly disable PlayGo (ezremote)
 
 
 @app.post("/api/cloud/push")
@@ -1592,8 +1846,10 @@ def api_cloud_push(req: CloudPushRequest, request: Request) -> JSONResponse:
             # handed. A signed Sony CDN URL can't be decorated, but a proxied URL
             # is ours -- the proxy endpoint ignores the query string.
             if proxied:
-                params = urlencode({"content_id": req.content_id, "name": name, "icon": ""})
-                url = f"{url}?{params}"
+                q = {"content_id": req.content_id, "name": name, "icon": ""}
+                if req.playgo is False:  # only flagged when off; on is the DPI default
+                    q["playgo"] = "0"
+                url = f"{url}?{urlencode(q)}"
             result = _push_ezremote(req.console_ip, req.console_port, url)
         elif protocol == "remote_pkg":
             result = _push_remote_pkg(req.console_ip, req.console_port, url)

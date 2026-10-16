@@ -13,6 +13,9 @@ services:
       # host:port the console downloads from. REQUIRED with bridge networking
       # (below) since the app cannot auto-detect the reachable address.
       PUBLIC_HOST: 192.168.1.10:6767
+      # Bridge networking cannot broadcast for consoles, so name the LAN here and
+      # the server sweeps it at startup to fill the console IP picker.
+      # CONSOLE_SUBNET: 192.168.1.0/24
 
     volumes:
       - "/mnt/user/games/ps4:/ps4:ro"
